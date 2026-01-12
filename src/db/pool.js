@@ -1,21 +1,17 @@
 // Database Connection Pool
 const { Pool } = require('pg');
-const config = require('../config');
+
+// Use DATABASE_URL directly - works better with cloud hosts
+const connectionString = process.env.DATABASE_URL;
 
 const pool = new Pool({
-  host: config.database.host,
-  port: config.database.port,
-  database: config.database.name,
-  user: config.database.user,
-  password: config.database.password,
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000,
+  connectionString: connectionString,
   ssl: {
     rejectUnauthorized: false
   },
-  // Force IPv4
-  family: 4
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
 });
 
 // Test connection on startup
