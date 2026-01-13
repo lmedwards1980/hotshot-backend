@@ -77,6 +77,7 @@ app.use('/api/ratings', ratingsRoutes);
 app.use('/api/company', companyRoutes);
 app.use('/api/announcements', announcementsRoutes);
 app.use('/api/dispatchers', require('./routes/dispatchers'));
+app.use('/api/invoices', require('./routes/invoices'));
 app.use('/api/rates', ratesRoutes);
 app.use('/api/matching', matchingRoutes);
 app.use('/api/notifications', notificationsRoutes);
@@ -109,4 +110,5 @@ app.use((err, req, res, next) => {
 });
 
 module.exports = app;
+
 
