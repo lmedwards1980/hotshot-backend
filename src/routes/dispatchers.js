@@ -419,6 +419,71 @@ router.put('/drivers/:driverId',
       
       if (commissionRate === undefined) {
         return res.status(400).json({ error: 'Commission rate required' });
+
+/**
+ * GET /dispatchers/drivers/:driverId/active-load
+ * Get driver's current active load (for fleet map)
+ */
+router.get('/drivers/:driverId/active-load',
+  authenticate,
+  requireDispatcher,
+  async (req, res) => {
+    try {
+      const { driverId } = req.params;
+      
+      // Verify driver belongs to this dispatcher
+      const relationship = await pool.query(`
+        SELECT id FROM dispatcher_drivers
+        WHERE dispatcher_id = router.put('/drivers/:driverId',
+  authenticate,
+  requireDispatcher,
+  async (req, res) => {
+    try {
+      const { driverId } = req.params;
+      const { commissionRate } = req.body;
+      
+      if (commissionRate === undefined) {
+        return res.status(400).json({ error: 'Commission rate required' }); AND driver_id = $2 AND status = 'active'
+      `, [req.user.id, driverId]);
+      
+      if (relationship.rows.length === 0) {
+        return res.status(403).json({ error: 'Driver not in your fleet' });
+      }
+      
+      // Get driver's active load
+      const result = await pool.query(`
+        SELECT 
+          l.id, l.status, l.load_type,
+          l.pickup_city, l.pickup_state, l.pickup_lat, l.pickup_lng,
+          l.delivery_city, l.delivery_state, l.delivery_lat, l.delivery_lng,
+          l.price, l.driver_payout, l.dispatcher_commission
+        FROM loads l
+        WHERE l.driver_id = router.put('/drivers/:driverId',
+  authenticate,
+  requireDispatcher,
+  async (req, res) => {
+    try {
+      const { driverId } = req.params;
+      const { commissionRate } = req.body;
+      
+      if (commissionRate === undefined) {
+        return res.status(400).json({ error: 'Commission rate required' });
+          AND l.status IN ('assigned', 'accepted', 'en_route_pickup', 'at_pickup', 'picked_up', 'en_route_delivery', 'at_delivery')
+        ORDER BY l.assigned_at DESC
+        LIMIT 1
+      `, [driverId]);
+      
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: 'No active load', load: null });
+      }
+      
+      res.json({ load: result.rows[0] });
+    } catch (error) {
+      console.error('[Dispatcher] Get driver active load error:', error);
+      res.status(500).json({ error: 'Failed to get active load' });
+    }
+  }
+);
       }
       
       const rate = parseFloat(commissionRate);
@@ -1332,3 +1397,4 @@ router.post('/request/:dispatcherId',
 );
 
 module.exports = router;
+
