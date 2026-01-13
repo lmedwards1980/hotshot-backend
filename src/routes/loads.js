@@ -4,6 +4,7 @@ const { pool } = require('../db/pool');
 const { authenticate, requireUserType } = require('../middleware/auth');
 
 const router = express.Router();
+const notificationService = require('../services/notificationService');
 
 /**
  * POST /loads/seed
@@ -637,6 +638,16 @@ router.post('/:id/accept',
         [req.user.id, req.params.id]
       );
 
+      // Notify shipper that driver accepted
+      const load = result.rows[0];
+      const driverResult = await pool.query('SELECT first_name, last_name FROM users WHERE id = $1', [req.user.id]);
+      const driverName = driverResult.rows[0] ? `${driverResult.rows[0].first_name} ${driverResult.rows[0].last_name || ''}`.trim() : 'Driver';
+      
+      notificationService.notifyShipperDriverAccepted(load.shipper_id, driverName, {
+        loadId: load.id,
+        deliveryCity: load.delivery_city,
+      }).catch(err => console.error('[Notifications] Error:', err));
+
       res.json({
         message: 'Load accepted',
         load: formatLoadResponse(result.rows[0]),
@@ -694,6 +705,19 @@ router.put('/:id/status',
         : [status, req.params.id];
 
       const result = await pool.query(updateQuery, params);
+
+      // Notify shipper of status change
+      const load = result.rows[0];
+      if (load.shipper_id && req.user.role === 'driver') {
+        const driverResult = await pool.query('SELECT first_name, last_name FROM users WHERE id = $1', [req.user.id]);
+        const driverName = driverResult.rows[0] ? `${driverResult.rows[0].first_name} ${driverResult.rows[0].last_name || ''}`.trim() : 'Driver';
+        
+        notificationService.notifyShipperStatusChange(load.shipper_id, status, driverName, {
+          loadId: load.id,
+          deliveryCity: load.delivery_city,
+          pickupCity: load.pickup_city,
+        }).catch(err => console.error('[Notifications] Status change error:', err));
+      }
 
       res.json({
         message: `Status updated to ${status}`,
@@ -820,3 +844,7 @@ function formatLoadResponse(load, detailed = false) {
 }
 
 module.exports = router;
+
+
+
+
