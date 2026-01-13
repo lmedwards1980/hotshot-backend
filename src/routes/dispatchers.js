@@ -1396,5 +1396,209 @@ router.post('/request/:dispatcherId',
   }
 );
 
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DISPATCHER ACTIVITY FEED
+// ═══════════════════════════════════════════════════════════════════════════════
+
+router.get('/activity', authenticate, async (req, res) => {
+  try {
+    const { filter = 'all', limit = 50 } = req.query;
+    
+    let query = `
+      SELECT 
+        l.id, l.status, l.pickup_city, l.delivery_city,
+        l.price, l.driver_payout, l.dispatcher_commission,
+        l.assigned_at, l.picked_up_at, l.delivered_at, l.completed_at, l.updated_at,
+        d.id as driver_id,
+        d.first_name || ' ' || COALESCE(d.last_name, '') as driver_name
+      FROM loads l
+      JOIN dispatcher_drivers dd ON l.driver_id = dd.driver_id
+      JOIN users d ON l.driver_id = d.id
+      WHERE dd.dispatcher_id = $1 AND dd.status = 'active'
+    `;
+    
+    if (filter === 'loads') {
+      query += ` AND l.status IN ('assigned', 'en_route_pickup', 'picked_up', 'en_route_delivery', 'delivered')`;
+    } else if (filter === 'earnings') {
+      query += ` AND l.status IN ('delivered', 'completed') AND l.dispatcher_commission > 0`;
+    }
+    
+    query += ` ORDER BY COALESCE(l.updated_at, l.created_at) DESC LIMIT $2`;
+    
+    const result = await pool.query(query, [req.user.id, parseInt(limit)]);
+    
+    const activities = result.rows.map(load => {
+      let type = 'load_update', message = '', created_at = load.updated_at;
+      if (load.completed_at) { type = 'load_completed'; message = 'Completed delivery'; created_at = load.completed_at; }
+      else if (load.delivered_at) { type = 'load_delivered'; message = 'Delivered load'; created_at = load.delivered_at; }
+      else if (load.picked_up_at) { type = 'load_picked_up'; message = 'Picked up load'; created_at = load.picked_up_at; }
+      else if (load.assigned_at) { type = 'load_assigned'; message = 'Accepted load assignment'; created_at = load.assigned_at; }
+      
+      return {
+        id: `${load.id}-${type}`, type, driver_id: load.driver_id, driver_name: load.driver_name,
+        load_id: load.id, pickup_city: load.pickup_city, delivery_city: load.delivery_city,
+        amount: parseFloat(load.price) || 0, commission: parseFloat(load.dispatcher_commission) || 0,
+        status: load.status, message, created_at,
+      };
+    });
+    
+    res.json({ activities });
+  } catch (error) {
+    console.error('[Dispatcher Activity] Error:', error);
+    res.status(500).json({ error: 'Failed to fetch activity' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DISPATCHER SETTINGS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+router.get('/settings', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT dispatcher_company_name, dispatcher_bio, default_commission_rate
+      FROM users WHERE id = $1 AND is_dispatcher = true
+    `, [req.user.id]);
+    
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Dispatcher not found' });
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('[Dispatcher Settings] GET error:', error);
+    res.status(500).json({ error: 'Failed to fetch settings' });
+  }
+});
+
+router.put('/settings', authenticate, async (req, res) => {
+  try {
+    const { companyName, bio, defaultCommissionRate } = req.body;
+    
+    if (defaultCommissionRate !== undefined) {
+      const rate = parseInt(defaultCommissionRate);
+      if (isNaN(rate) || rate < 0 || rate > 50) {
+        return res.status(400).json({ error: 'Commission rate must be between 0 and 50' });
+      }
+    }
+    
+    await pool.query(`
+      UPDATE users SET
+        dispatcher_company_name = COALESCE($1, dispatcher_company_name),
+        dispatcher_bio = COALESCE($2, dispatcher_bio),
+        default_commission_rate = COALESCE($3, default_commission_rate),
+        updated_at = NOW()
+      WHERE id = $4 AND is_dispatcher = true
+    `, [companyName, bio, defaultCommissionRate, req.user.id]);
+    
+    res.json({ message: 'Settings updated' });
+  } catch (error) {
+    console.error('[Dispatcher Settings] PUT error:', error);
+    res.status(500).json({ error: 'Failed to update settings' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DRIVER COMMISSION MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
+router.put('/drivers/:driverId/commission', authenticate, async (req, res) => {
+  try {
+    const { driverId } = req.params;
+    const { commissionRate } = req.body;
+    
+    const rate = parseInt(commissionRate);
+    if (isNaN(rate) || rate < 0 || rate > 50) {
+      return res.status(400).json({ error: 'Commission rate must be between 0 and 50' });
+    }
+    
+    const check = await pool.query(`
+      SELECT id FROM dispatcher_drivers WHERE dispatcher_id = $1 AND driver_id = $2 AND status = 'active'
+    `, [req.user.id, driverId]);
+    
+    if (check.rows.length === 0) return res.status(404).json({ error: 'Driver not found in your fleet' });
+    
+    await pool.query(`
+      UPDATE dispatcher_drivers SET commission_rate = $1, updated_at = NOW()
+      WHERE dispatcher_id = $2 AND driver_id = $3
+    `, [rate, req.user.id, driverId]);
+    
+    res.json({ message: 'Commission rate updated', commissionRate: rate });
+  } catch (error) {
+    console.error('[Dispatcher Commission] Error:', error);
+    res.status(500).json({ error: 'Failed to update commission rate' });
+  }
+});
+
+router.delete('/drivers/:driverId', authenticate, async (req, res) => {
+  try {
+    const { driverId } = req.params;
+    
+    const result = await pool.query(`
+      UPDATE dispatcher_drivers SET status = 'removed', updated_at = NOW()
+      WHERE dispatcher_id = $1 AND driver_id = $2 AND status = 'active'
+      RETURNING id
+    `, [req.user.id, driverId]);
+    
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Driver not found in your fleet' });
+    res.json({ message: 'Driver removed from fleet' });
+  } catch (error) {
+    console.error('[Dispatcher Remove Driver] Error:', error);
+    res.status(500).json({ error: 'Failed to remove driver' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DRIVER REQUESTS (Accept/Reject)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+router.post('/requests/:requestId/accept', authenticate, async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    
+    const request = await pool.query(`
+      SELECT dr.*, u.default_commission_rate as dispatcher_default_rate
+      FROM dispatcher_requests dr
+      JOIN users u ON dr.dispatcher_id = u.id
+      WHERE dr.id = $1 AND dr.dispatcher_id = $2 AND dr.status = 'pending'
+    `, [requestId, req.user.id]);
+    
+    if (request.rows.length === 0) return res.status(404).json({ error: 'Request not found' });
+    
+    const req_data = request.rows[0];
+    
+    await pool.query(`
+      INSERT INTO dispatcher_drivers (dispatcher_id, driver_id, commission_rate, status)
+      VALUES ($1, $2, $3, 'active')
+      ON CONFLICT (dispatcher_id, driver_id) 
+      DO UPDATE SET status = 'active', commission_rate = $3, updated_at = NOW()
+    `, [req.user.id, req_data.driver_id, req_data.dispatcher_default_rate || 10]);
+    
+    await pool.query(`UPDATE dispatcher_requests SET status = 'accepted', updated_at = NOW() WHERE id = $1`, [requestId]);
+    
+    res.json({ message: 'Request accepted' });
+  } catch (error) {
+    console.error('[Dispatcher Accept Request] Error:', error);
+    res.status(500).json({ error: 'Failed to accept request' });
+  }
+});
+
+router.post('/requests/:requestId/reject', authenticate, async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    
+    const result = await pool.query(`
+      UPDATE dispatcher_requests SET status = 'rejected', updated_at = NOW()
+      WHERE id = $1 AND dispatcher_id = $2 AND status = 'pending'
+      RETURNING id
+    `, [requestId, req.user.id]);
+    
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Request not found' });
+    res.json({ message: 'Request rejected' });
+  } catch (error) {
+    console.error('[Dispatcher Reject Request] Error:', error);
+    res.status(500).json({ error: 'Failed to reject request' });
+  }
+});
+
 module.exports = router;
+
 
