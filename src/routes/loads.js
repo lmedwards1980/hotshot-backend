@@ -843,7 +843,90 @@ function formatLoadResponse(load, detailed = false) {
   return response;
 }
 
+
+/**
+ * POST /loads/:id/rate
+ * Rate a driver (shipper only)
+ */
+router.post('/:id/rate',
+  authenticate,
+  async (req, res) => {
+    try {
+      const { rating, comment, ratingType } = req.body;
+      const loadId = req.params.id;
+      const shipperId = req.user.id;
+
+      // Validate rating
+      if (!rating || rating < 1 || rating > 5) {
+        return res.status(400).json({ error: 'Rating must be between 1 and 5' });
+      }
+
+      // Verify load exists and belongs to shipper
+      const loadCheck = await pool.query(
+        `SELECT * FROM loads WHERE id = $1 AND shipper_id = $2 AND status IN ('delivered', 'completed')`,
+        [loadId, shipperId]
+      );
+
+      if (loadCheck.rows.length === 0) {
+        return res.status(404).json({ error: 'Load not found or not eligible for rating' });
+      }
+
+      const load = loadCheck.rows[0];
+      
+      if (!load.driver_id) {
+        return res.status(400).json({ error: 'No driver assigned to this load' });
+      }
+
+      // Check if already rated
+      if (load.driver_rated) {
+        return res.status(409).json({ error: 'Driver already rated for this load' });
+      }
+
+      // Update load with rating
+      await pool.query(
+        `UPDATE loads 
+         SET driver_rated = true, 
+             driver_rating = $1, 
+             driver_review = $2,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = $3`,
+        [rating, comment || null, loadId]
+      );
+
+      // Update driver's average rating
+      await pool.query(`
+        UPDATE users
+        SET
+          rating = (
+            SELECT COALESCE(ROUND(AVG(driver_rating)::numeric, 2), 5.00)
+            FROM loads
+            WHERE driver_id = $1 AND driver_rated = true
+          ),
+          rating_count = (
+            SELECT COUNT(*)
+            FROM loads
+            WHERE driver_id = $1 AND driver_rated = true
+          )
+        WHERE id = $1
+      `, [load.driver_id]);
+
+      // Notify driver of rating
+      notificationService.notifyDriverRating(load.driver_id, req.user.firstName || 'Shipper', rating >= 4, loadId)
+        .catch(err => console.error('[Notifications] Rating error:', err));
+
+      res.json({
+        message: 'Rating submitted successfully',
+        rating: rating,
+      });
+    } catch (error) {
+      console.error('[Loads] Rate error:', error);
+      res.status(500).json({ error: 'Failed to submit rating' });
+    }
+  }
+);
+
 module.exports = router;
+
 
 
 
