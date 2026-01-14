@@ -1,4 +1,4 @@
-// Auth Routes - With Company & Team Support
+// Auth Routes - With Company & Team Support + Org/Role Model
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
@@ -18,18 +18,96 @@ const generateSlug = (name) => {
 };
 
 /**
+ * Helper: Get user's orgs and roles
+ */
+const getUserOrgs = async (userId) => {
+  const result = await pool.query(`
+    SELECT 
+      o.id,
+      o.org_type as type,
+      o.name,
+      o.verification_status,
+      m.role,
+      m.is_primary,
+      m.permissions
+    FROM memberships m
+    JOIN orgs o ON m.org_id = o.id
+    WHERE m.user_id = $1 AND m.is_active = true AND o.is_active = true
+    ORDER BY m.is_primary DESC, m.joined_at ASC
+  `, [userId]);
+  
+  return result.rows.map(row => ({
+    id: row.id,
+    type: row.type,
+    name: row.name,
+    verificationStatus: row.verification_status,
+    role: row.role,
+    isPrimary: row.is_primary,
+    permissions: row.permissions
+  }));
+};
+
+/**
+ * Helper: Create org and membership for user
+ */
+const createOrgForUser = async (client, userId, orgData) => {
+  const { orgType, orgName, mcNumber, dotNumber, brokerMcNumber } = orgData;
+  
+  if (!orgType || !orgName) return null;
+  
+  if (!['shipper', 'broker', 'carrier'].includes(orgType)) return null;
+
+  // Create org
+  const orgResult = await client.query(`
+    INSERT INTO orgs (org_type, name, mc_number, dot_number, broker_mc_number)
+    VALUES ($1, $2, $3, $4, $5)
+    RETURNING *
+  `, [orgType, orgName, mcNumber || null, dotNumber || null, brokerMcNumber || null]);
+
+  const org = orgResult.rows[0];
+
+  // Determine admin role
+  let adminRole;
+  switch (orgType) {
+    case 'shipper': adminRole = 'shipper_admin'; break;
+    case 'broker': adminRole = 'broker_admin'; break;
+    case 'carrier': adminRole = 'carrier_admin'; break;
+  }
+
+  // Create membership
+  await client.query(`
+    INSERT INTO memberships (user_id, org_id, role, is_primary)
+    VALUES ($1, $2, $3, true)
+  `, [userId, org.id, adminRole]);
+
+  // Initialize trust signals for carriers
+  if (orgType === 'carrier') {
+    await client.query(`INSERT INTO trust_signals (org_id) VALUES ($1)`, [org.id]);
+  }
+
+  return {
+    id: org.id,
+    type: org.org_type,
+    name: org.name,
+    verificationStatus: org.verification_status,
+    role: adminRole,
+    isPrimary: true
+  };
+};
+
+/**
  * POST /auth/register
- * Register a new shipper (solo or company)
+ * Register a new user (optionally with org)
  */
 router.post('/register', async (req, res) => {
   const client = await pool.connect();
-  
+
   try {
-    const { 
-      email, 
-      password, 
-      firstName, 
-      lastName, 
+    const {
+      email,
+      password,
+      firstName,
+      lastName,
       phone,
       // Account type: 'solo' or 'company'
       accountType = 'solo',
@@ -37,11 +115,17 @@ router.post('/register', async (req, res) => {
       companyName,
       department,
       jobTitle,
+      // NEW: Org fields for new org model
+      orgType,      // 'shipper', 'broker', 'carrier'
+      orgName,      // Organization name
+      mcNumber,     // Carrier MC number
+      dotNumber,    // Carrier DOT number
+      brokerMcNumber, // Broker MC number
       // Legacy support
       name,
       userType,
       role,
-      referralCode 
+      referralCode
     } = req.body;
 
     // Handle legacy 'name' field
@@ -98,22 +182,20 @@ router.post('/register', async (req, res) => {
     let shipperRole = 'user';
     let userCompanyName = null;
 
-    // Handle company account type
+    // Handle company account type (legacy)
     if (accountType === 'company' && companyName) {
-      // Create company first
       const slug = generateSlug(companyName);
-      
+
       const companyResult = await client.query(
         `INSERT INTO companies (name, display_name, slug, email, plan_id, subscription_status, subscription_started_at)
          VALUES ($1, $2, $3, $4, 'solo', 'active', NOW())
          RETURNING id`,
         [companyName.trim(), companyName.trim(), slug, email.toLowerCase()]
       );
-      
+
       companyId = companyResult.rows[0].id;
-      shipperRole = 'owner'; // First user is owner
+      shipperRole = 'owner';
     } else if (companyName) {
-      // Solo shipper with company name (display only)
       userCompanyName = companyName.trim();
     }
 
@@ -121,22 +203,22 @@ router.post('/register', async (req, res) => {
     const result = await client.query(
       `INSERT INTO users (
         email, phone, password_hash, first_name, last_name, role,
-        referral_code, referred_by, 
+        referral_code, referred_by,
         account_type, company_id, company_name, department, job_title, shipper_role,
         approval_status
       )
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-       RETURNING id, email, phone, first_name, last_name, role, referral_code, 
+       RETURNING id, email, phone, first_name, last_name, role, referral_code,
                  account_type, company_id, company_name, department, job_title, shipper_role,
                  approval_status, created_at`,
       [
-        email.toLowerCase(), 
-        phone, 
-        passwordHash, 
-        fName, 
-        lName, 
+        email.toLowerCase(),
+        phone,
+        passwordHash,
+        fName,
+        lName,
         userRole,
-        newReferralCode, 
+        newReferralCode,
         referredById,
         accountType,
         companyId,
@@ -158,6 +240,18 @@ router.post('/register', async (req, res) => {
       );
     }
 
+    // NEW: Create org if orgType and orgName provided
+    let createdOrg = null;
+    if (orgType && orgName) {
+      createdOrg = await createOrgForUser(client, user.id, {
+        orgType,
+        orgName,
+        mcNumber,
+        dotNumber,
+        brokerMcNumber
+      });
+    }
+
     // If referred, create referral record
     if (referredById) {
       try {
@@ -176,7 +270,7 @@ router.post('/register', async (req, res) => {
     // Generate token
     const token = generateToken(user.id);
 
-    // Get company info if exists
+    // Get company info if exists (legacy)
     let companyInfo = null;
     if (user.company_id) {
       const companyRes = await pool.query(
@@ -187,6 +281,9 @@ router.post('/register', async (req, res) => {
         companyInfo = companyRes.rows[0];
       }
     }
+
+    // Get all orgs (including just-created one)
+    const orgs = await getUserOrgs(user.id);
 
     res.status(201).json({
       message: 'Registration successful',
@@ -209,6 +306,9 @@ router.post('/register', async (req, res) => {
         shipperRole: user.shipper_role,
         company: companyInfo,
       },
+      // NEW: Include orgs
+      orgs,
+      primaryOrg: orgs.find(o => o.isPrimary) || orgs[0] || null,
       token,
     });
   } catch (error) {
@@ -226,7 +326,7 @@ router.post('/register', async (req, res) => {
  */
 router.post('/register/invite', async (req, res) => {
   const client = await pool.connect();
-  
+
   try {
     const { token: inviteToken, password, firstName, lastName, phone } = req.body;
 
@@ -256,7 +356,7 @@ router.post('/register/invite', async (req, res) => {
     );
 
     if (!canAddResult.rows[0].can_add) {
-      return res.status(403).json({ 
+      return res.status(403).json({
         error: 'Company has reached user limit. Please upgrade your plan.',
         code: 'USER_LIMIT_REACHED'
       });
@@ -309,7 +409,7 @@ router.post('/register/invite', async (req, res) => {
 
     // Update invitation status
     await client.query(
-      `UPDATE company_invitations 
+      `UPDATE company_invitations
        SET status = 'accepted', accepted_at = NOW(), accepted_by = $1
        WHERE id = $2`,
       [user.id, invite.id]
@@ -319,6 +419,9 @@ router.post('/register/invite', async (req, res) => {
 
     // Generate token
     const token = generateToken(user.id);
+
+    // Get orgs
+    const orgs = await getUserOrgs(user.id);
 
     res.status(201).json({
       message: 'Registration successful',
@@ -336,6 +439,8 @@ router.post('/register/invite', async (req, res) => {
         department: user.department,
         shipperRole: user.shipper_role,
       },
+      orgs,
+      primaryOrg: orgs.find(o => o.isPrimary) || orgs[0] || null,
       token,
     });
   } catch (error) {
@@ -395,8 +500,8 @@ router.post('/login', async (req, res) => {
 
     // Find user with company info
     const result = await pool.query(
-      `SELECT u.id, u.email, u.phone, u.first_name, u.last_name, u.role, 
-              u.password_hash, u.is_active, u.account_type, u.company_id, 
+      `SELECT u.id, u.email, u.phone, u.first_name, u.last_name, u.role,
+              u.password_hash, u.is_active, u.account_type, u.company_id,
               u.company_name, u.department, u.job_title, u.shipper_role,
               c.name as org_company_name, c.display_name, c.plan_id, c.slug
        FROM users u
@@ -437,7 +542,7 @@ router.post('/login', async (req, res) => {
 
     const token = generateToken(user.id);
 
-    // Build company object if exists
+    // Build company object if exists (legacy)
     let company = null;
     if (user.company_id) {
       company = {
@@ -448,6 +553,10 @@ router.post('/login', async (req, res) => {
         slug: user.slug,
       };
     }
+
+    // NEW: Get user's orgs and roles
+    const orgs = await getUserOrgs(user.id);
+    const primaryOrg = orgs.find(o => o.isPrimary) || orgs[0] || null;
 
     res.json({
       message: 'Login successful',
@@ -468,6 +577,9 @@ router.post('/login', async (req, res) => {
         shipperRole: user.shipper_role,
         company,
       },
+      // NEW: Include orgs and primary org
+      orgs,
+      primaryOrg,
       token,
     });
   } catch (error) {
@@ -495,10 +607,9 @@ router.get('/me', authenticate, async (req, res) => {
 
     const user = result.rows[0];
 
-    // Build company object
+    // Build company object (legacy)
     let company = null;
     if (user.company_id) {
-      // Get team count
       const teamCount = await pool.query(
         'SELECT COUNT(*) as count FROM users WHERE company_id = $1 AND is_active = true',
         [user.company_id]
@@ -514,6 +625,10 @@ router.get('/me', authenticate, async (req, res) => {
         teamCount: parseInt(teamCount.rows[0].count),
       };
     }
+
+    // NEW: Get user's orgs
+    const orgs = await getUserOrgs(user.id);
+    const primaryOrg = orgs.find(o => o.isPrimary) || orgs[0] || null;
 
     res.json({
       id: user.id,
@@ -534,6 +649,9 @@ router.get('/me', authenticate, async (req, res) => {
       jobTitle: user.job_title,
       shipperRole: user.shipper_role,
       company,
+      // NEW: Include orgs
+      orgs,
+      primaryOrg,
     });
   } catch (error) {
     console.error('[Auth] Get profile error:', error);
