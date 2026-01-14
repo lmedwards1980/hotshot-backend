@@ -1,14 +1,14 @@
 const express = require('express');
 const router = express.Router();
-const pool = require('../db/pool');
-const auth = require('../middleware/auth');
+const { pool } = require('../db/pool');
+const { authenticate } = require('../middleware/auth');
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ORGANIZATIONS
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // POST /orgs - Create a new organization
-router.post('/', auth, async (req, res) => {
+router.post('/', authenticate, async (req, res) => {
   const client = await pool.connect();
   
   try {
@@ -101,7 +101,7 @@ router.post('/', auth, async (req, res) => {
 });
 
 // GET /orgs - List user's organizations
-router.get('/', auth, async (req, res) => {
+router.get('/', authenticate, async (req, res) => {
   try {
     const userId = req.user.id;
 
@@ -133,7 +133,7 @@ router.get('/', auth, async (req, res) => {
 });
 
 // GET /orgs/:id - Get single organization
-router.get('/:id', auth, async (req, res) => {
+router.get('/:id', authenticate, async (req, res) => {
   try {
     const { id } = req.params;
     const userId = req.user.id;
@@ -182,7 +182,7 @@ router.get('/:id', auth, async (req, res) => {
 });
 
 // PUT /orgs/:id - Update organization
-router.put('/:id', auth, async (req, res) => {
+router.put('/:id', authenticate, async (req, res) => {
   try {
     const { id } = req.params;
     const userId = req.user.id;
@@ -260,7 +260,7 @@ router.put('/:id', auth, async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // GET /orgs/:id/members - List organization members
-router.get('/:id/members', auth, async (req, res) => {
+router.get('/:id/members', authenticate, async (req, res) => {
   try {
     const { id } = req.params;
     const userId = req.user.id;
@@ -319,8 +319,8 @@ router.get('/:id/members', auth, async (req, res) => {
   }
 });
 
-// PUT /orgs/:id/members/:userId - Update member role
-router.put('/:id/members/:memberId', auth, async (req, res) => {
+// PUT /orgs/:id/members/:memberId - Update member role
+router.put('/:id/members/:memberId', authenticate, async (req, res) => {
   try {
     const { id, memberId } = req.params;
     const userId = req.user.id;
@@ -379,7 +379,7 @@ router.put('/:id/members/:memberId', auth, async (req, res) => {
 });
 
 // DELETE /orgs/:id/members/:memberId - Remove member
-router.delete('/:id/members/:memberId', auth, async (req, res) => {
+router.delete('/:id/members/:memberId', authenticate, async (req, res) => {
   try {
     const { id, memberId } = req.params;
     const userId = req.user.id;
@@ -432,7 +432,7 @@ router.delete('/:id/members/:memberId', auth, async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // POST /orgs/:id/invites - Create invite
-router.post('/:id/invites', auth, async (req, res) => {
+router.post('/:id/invites', authenticate, async (req, res) => {
   try {
     const { id } = req.params;
     const userId = req.user.id;
@@ -520,7 +520,7 @@ router.post('/:id/invites', auth, async (req, res) => {
 });
 
 // GET /orgs/:id/invites - List pending invites
-router.get('/:id/invites', auth, async (req, res) => {
+router.get('/:id/invites', authenticate, async (req, res) => {
   try {
     const { id } = req.params;
     const userId = req.user.id;
@@ -565,7 +565,7 @@ router.get('/:id/invites', auth, async (req, res) => {
 });
 
 // DELETE /orgs/:id/invites/:inviteId - Cancel invite
-router.delete('/:id/invites/:inviteId', auth, async (req, res) => {
+router.delete('/:id/invites/:inviteId', authenticate, async (req, res) => {
   try {
     const { id, inviteId } = req.params;
     const userId = req.user.id;
@@ -598,7 +598,7 @@ router.delete('/:id/invites/:inviteId', auth, async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // POST /orgs/invites/:token/accept - Accept invite
-router.post('/invites/:token/accept', auth, async (req, res) => {
+router.post('/invites/:token/accept', authenticate, async (req, res) => {
   const client = await pool.connect();
   
   try {
