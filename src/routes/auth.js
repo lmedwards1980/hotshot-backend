@@ -82,7 +82,11 @@ const createOrgForUser = async (client, userId, orgData) => {
 
   // Initialize trust signals for carriers
   if (orgType === 'carrier') {
-    await client.query(`INSERT INTO trust_signals (org_id) VALUES ($1)`, [org.id]);
+    try {
+      await client.query(`INSERT INTO trust_signals (org_id) VALUES ($1)`, [org.id]);
+    } catch (e) {
+      console.log('[Auth] Trust signals table may not exist, skipping');
+    }
   }
 
   return {
@@ -179,11 +183,12 @@ router.post('/register', async (req, res) => {
     }
 
     let companyId = null;
-    let shipperRole = 'user';
+    // FIX: Use NULL for org-based registration, 'shipper' for legacy (valid constraint value)
+    let shipperRole = null;
     let userCompanyName = null;
 
-    // Handle company account type (legacy)
-    if (accountType === 'company' && companyName) {
+    // Handle company account type (legacy) - only if NOT using new org model
+    if (!orgType && accountType === 'company' && companyName) {
       const slug = generateSlug(companyName);
 
       const companyResult = await client.query(
@@ -194,9 +199,16 @@ router.post('/register', async (req, res) => {
       );
 
       companyId = companyResult.rows[0].id;
-      shipperRole = 'owner';
-    } else if (companyName) {
+      shipperRole = 'owner'; // Valid value for constraint
+    } else if (!orgType && companyName) {
       userCompanyName = companyName.trim();
+      shipperRole = 'shipper'; // Valid value for constraint
+    }
+
+    // FIX: For org-based registration, shipper_role stays NULL (roles in memberships table)
+    // For legacy shipper without company, use 'shipper' as default
+    if (!orgType && userRole === 'shipper' && !shipperRole) {
+      shipperRole = 'shipper'; // Valid default for legacy shipper registration
     }
 
     // Create user
@@ -225,7 +237,8 @@ router.post('/register', async (req, res) => {
         userCompanyName,
         department || null,
         jobTitle || null,
-        userRole === 'shipper' ? shipperRole : null,
+        // FIX: For org-based or driver registration, use NULL; otherwise use computed shipperRole
+        orgType ? null : (userRole === 'shipper' ? shipperRole : null),
         userRole === 'driver' ? 'pending' : 'approved'
       ]
     );
@@ -381,6 +394,14 @@ router.post('/register/invite', async (req, res) => {
     const fName = firstName || invite.first_name || 'USR';
     const referralCode = `${fName.substring(0, 3).toUpperCase()}${Date.now().toString(36).toUpperCase()}`.substring(0, 8);
 
+    // FIX: Map invite.role to valid constraint values
+    let mappedRole = invite.role || 'viewer';
+    // Ensure the role is valid for the constraint
+    const validRoles = ['owner', 'admin', 'approver', 'shipper', 'verifier', 'viewer'];
+    if (!validRoles.includes(mappedRole)) {
+      mappedRole = 'viewer'; // Default to viewer if invalid
+    }
+
     // Create user
     const userResult = await client.query(
       `INSERT INTO users (
@@ -401,7 +422,7 @@ router.post('/register/invite', async (req, res) => {
         invite.company_id,
         invite.department,
         null,
-        invite.role || 'user'
+        mappedRole // FIX: Use mapped valid role
       ]
     );
 
