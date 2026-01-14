@@ -1,10 +1,32 @@
-// Load Routes - Updated with Shipper Features
+// Load Routes - Updated with Org Context for 5-Role Model
 const express = require('express');
 const { pool } = require('../db/pool');
 const { authenticate, requireUserType } = require('../middleware/auth');
 
 const router = express.Router();
 const notificationService = require('../services/notificationService');
+
+/**
+ * Helper: Get user's primary org and role
+ */
+const getUserPrimaryOrg = async (userId) => {
+  const result = await pool.query(`
+    SELECT 
+      o.id as org_id,
+      o.org_type,
+      o.name as org_name,
+      o.verification_status,
+      m.role,
+      m.permissions
+    FROM memberships m
+    JOIN orgs o ON m.org_id = o.id
+    WHERE m.user_id = $1 AND m.is_active = true AND o.is_active = true
+    ORDER BY m.is_primary DESC, m.joined_at ASC
+    LIMIT 1
+  `, [userId]);
+  
+  return result.rows[0] || null;
+};
 
 /**
  * POST /loads/seed
@@ -29,6 +51,9 @@ router.post('/seed', async (req, res) => {
     if (!shipperId) {
       return res.status(400).json({ error: 'No users exist. Create a user first.' });
     }
+
+    // Get user's org if exists
+    const userOrg = await getUserPrimaryOrg(shipperId);
 
     const testLoads = [
       {
@@ -96,17 +121,19 @@ router.post('/seed', async (req, res) => {
 
       const result = await pool.query(
         `INSERT INTO loads (
-          shipper_id, description,
+          shipper_id, posted_by_user_id, posted_by_org_id,
+          description,
           pickup_address, pickup_city, pickup_state, pickup_zip,
           delivery_address, delivery_city, delivery_state, delivery_zip,
           distance_miles, weight_lbs, price, driver_payout, platform_fee,
           vehicle_type_required, is_fragile, requires_liftgate, requires_pallet_jack,
           load_type, expedited_fee,
           status, posted_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, 'posted', CURRENT_TIMESTAMP)
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, 'posted', CURRENT_TIMESTAMP)
         RETURNING id`,
         [
-          shipperId, load.description,
+          shipperId, shipperId, userOrg?.org_id || null,
+          load.description,
           load.pickup_address, load.pickup_city, load.pickup_state, load.pickup_zip,
           load.delivery_address, load.delivery_city, load.delivery_state, load.delivery_zip,
           load.distance_miles, load.weight_lbs, load.price, driverPayout, platformFee,
@@ -130,8 +157,8 @@ router.post('/seed', async (req, res) => {
 
 /**
  * POST /loads
- * Create a new load (shipper only)
- * Updated to support loadType, expeditedFee, pieces, company names
+ * Create a new load (shipper/broker only)
+ * Updated with org context and broker fields
  */
 router.post('/',
   authenticate,
@@ -142,11 +169,13 @@ router.post('/',
         description,
         // Pickup fields
         pickupAddress, pickupCity, pickupState, pickupZip,
+        pickupLat, pickupLng,
         pickupCompanyName, pickupContactName, pickupContactPhone,
         pickupDate, pickupTimeStart, pickupTimeEnd,
         pickupInstructions,
         // Delivery fields
         deliveryAddress, deliveryCity, deliveryState, deliveryZip,
+        deliveryLat, deliveryLng,
         deliveryCompanyName, deliveryContactName, deliveryContactPhone,
         deliveryDate, deliveryTimeStart, deliveryTimeEnd,
         deliveryInstructions,
@@ -156,24 +185,58 @@ router.post('/',
         specialRequirements,
         // Pricing & type
         price, loadType, expeditedFee,
+        distanceMiles,
+        // NEW: Broker fields
+        customerName,        // Broker's customer name
+        customerLoadNumber,  // Customer's load reference
+        customerPo,          // Customer PO number
+        customerRate,        // What broker charges customer
+        carrierPay,          // What broker pays carrier (their margin)
+        // NEW: Booking options
+        allowOffers,         // Allow carriers to submit offers
+        allowBookNow,        // Allow instant booking at posted rate
+        minOffer,            // Minimum acceptable offer
+        verifiedOnly,        // Only verified carriers can book
+        trackingRequired,    // Require tracking
       } = req.body;
 
-      // Simple distance estimate (would use real geocoding in production)
-      const distanceMiles = 100; // placeholder
-      const basePrice = price || distanceMiles * 2.5;
+      // Get user's org context
+      const userOrg = await getUserPrimaryOrg(req.user.id);
+      const isBroker = userOrg?.org_type === 'broker';
+
+      // Calculate pricing
+      const distance = parseFloat(distanceMiles) || 100;
+      const basePrice = parseFloat(price) || distance * 2.5;
       const totalExpedited = parseFloat(expeditedFee) || 0;
       const totalPrice = basePrice + totalExpedited;
-      const driverPayout = totalPrice * 0.85;
+      
+      // For brokers: carrier_pay is what they pay carrier, price is what customer pays
+      // For shippers: carrier_pay = driver_payout (85% of price)
+      let finalCarrierPay;
+      let finalCustomerRate;
+      
+      if (isBroker && carrierPay) {
+        finalCarrierPay = parseFloat(carrierPay);
+        finalCustomerRate = parseFloat(customerRate) || totalPrice;
+      } else {
+        finalCarrierPay = totalPrice * 0.85;
+        finalCustomerRate = null;
+      }
+      
+      const driverPayout = finalCarrierPay * 0.85; // Driver gets 85% of carrier pay
       const platformFee = totalPrice * 0.15;
 
       const result = await pool.query(
         `INSERT INTO loads (
-          shipper_id, description,
+          shipper_id, posted_by_user_id, posted_by_org_id,
+          description,
           pickup_address, pickup_city, pickup_state, pickup_zip,
+          pickup_lat, pickup_lng,
           pickup_company_name, pickup_contact_name, pickup_contact_phone,
           pickup_date, pickup_time_start, pickup_time_end,
           pickup_instructions,
           delivery_address, delivery_city, delivery_state, delivery_zip,
+          delivery_lat, delivery_lng,
           delivery_company_name, delivery_contact_name, delivery_contact_phone,
           delivery_date, delivery_time_start, delivery_time_end,
           delivery_instructions,
@@ -182,25 +245,43 @@ router.post('/',
           special_requirements,
           distance_miles, price, driver_payout, platform_fee,
           load_type, expedited_fee,
+          customer_name, customer_load_number, customer_po, customer_rate,
+          carrier_pay,
+          allow_offers, allow_book_now, min_offer,
+          verified_only, tracking_required,
           status, posted_at
         ) VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, 'posted', CURRENT_TIMESTAMP
+          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54,
+          'posted', CURRENT_TIMESTAMP
         ) RETURNING *`,
         [
-          req.user.id, description,
+          req.user.id, req.user.id, userOrg?.org_id || null,
+          description,
           pickupAddress, pickupCity, pickupState, pickupZip,
+          pickupLat || null, pickupLng || null,
           pickupCompanyName, pickupContactName, pickupContactPhone,
           pickupDate, pickupTimeStart, pickupTimeEnd,
           pickupInstructions,
           deliveryAddress, deliveryCity, deliveryState, deliveryZip,
+          deliveryLat || null, deliveryLng || null,
           deliveryCompanyName, deliveryContactName, deliveryContactPhone,
           deliveryDate, deliveryTimeStart, deliveryTimeEnd,
           deliveryInstructions,
           weightLbs, dimensions, pieces || 1, vehicleTypeRequired,
           isFragile || false, requiresLiftgate || false, requiresPalletJack || false,
           specialRequirements,
-          distanceMiles, totalPrice, driverPayout, platformFee,
+          distance, totalPrice, driverPayout, platformFee,
           loadType || 'standard', totalExpedited,
+          isBroker ? customerName : null,
+          isBroker ? customerLoadNumber : null,
+          isBroker ? customerPo : null,
+          finalCustomerRate,
+          finalCarrierPay,
+          allowOffers !== false, // default true
+          allowBookNow !== false, // default true
+          minOffer || null,
+          verifiedOnly || false,
+          trackingRequired !== false, // default true
         ]
       );
 
@@ -219,48 +300,84 @@ router.post('/',
 
 /**
  * GET /loads
- * Get loads (filtered by user type)
+ * Get loads (filtered by user type and org)
+ * - Shippers/Brokers: See all loads from their org
+ * - Drivers: See their assigned loads
+ * - Carriers/Dispatchers: See available loads to bid on
  */
 router.get('/', authenticate, async (req, res) => {
   try {
     const { status, limit = 20, offset = 0 } = req.query;
 
+    // Get user's org context
+    const userOrg = await getUserPrimaryOrg(req.user.id);
+
     let query;
     let params;
 
     if (req.user.role === 'shipper') {
-      // Shippers see their own loads
-      query = `
-        SELECT l.*, 
-          CONCAT(u.first_name, ' ', u.last_name) as driver_name,
-          u.phone as driver_phone
-        FROM loads l
-        LEFT JOIN users u ON l.driver_id = u.id
-        WHERE l.shipper_id = $1
-        ${status ? 'AND l.status = $2' : ''}
-        ORDER BY l.created_at DESC
-        LIMIT $${status ? 3 : 2} OFFSET $${status ? 4 : 3}`;
-      params = status
-        ? [req.user.id, status, limit, offset]
-        : [req.user.id, limit, offset];
+      // Shippers/Brokers see loads from their org (team visibility)
+      if (userOrg?.org_id) {
+        // Org member - see all org loads
+        query = `
+          SELECT l.*, 
+            CONCAT(u.first_name, ' ', u.last_name) as driver_name,
+            u.phone as driver_phone,
+            CONCAT(poster.first_name, ' ', poster.last_name) as posted_by_name,
+            o.name as org_name,
+            o.org_type
+          FROM loads l
+          LEFT JOIN users u ON l.driver_id = u.id
+          LEFT JOIN users poster ON l.posted_by_user_id = poster.id
+          LEFT JOIN orgs o ON l.posted_by_org_id = o.id
+          WHERE l.posted_by_org_id = $1
+          ${status ? 'AND l.status = $2' : ''}
+          ORDER BY l.created_at DESC
+          LIMIT $${status ? 3 : 2} OFFSET $${status ? 4 : 3}`;
+        params = status
+          ? [userOrg.org_id, status, limit, offset]
+          : [userOrg.org_id, limit, offset];
+      } else {
+        // Solo shipper - see only their loads
+        query = `
+          SELECT l.*, 
+            CONCAT(u.first_name, ' ', u.last_name) as driver_name,
+            u.phone as driver_phone
+          FROM loads l
+          LEFT JOIN users u ON l.driver_id = u.id
+          WHERE l.shipper_id = $1
+          ${status ? 'AND l.status = $2' : ''}
+          ORDER BY l.created_at DESC
+          LIMIT $${status ? 3 : 2} OFFSET $${status ? 4 : 3}`;
+        params = status
+          ? [req.user.id, status, limit, offset]
+          : [req.user.id, limit, offset];
+      }
     } else {
-      // Drivers see available loads or their assigned loads
+      // Drivers/Carriers/Dispatchers
       if (status === 'available') {
         query = `
           SELECT l.*, 
-            CONCAT(u.first_name, ' ', u.last_name) as shipper_name
+            CONCAT(u.first_name, ' ', u.last_name) as shipper_name,
+            o.name as shipper_org_name,
+            o.org_type as shipper_org_type,
+            o.verification_status as shipper_verification
           FROM loads l
           JOIN users u ON l.shipper_id = u.id
+          LEFT JOIN orgs o ON l.posted_by_org_id = o.id
           WHERE l.status = 'posted'
           ORDER BY l.posted_at DESC
           LIMIT $1 OFFSET $2`;
         params = [limit, offset];
       } else {
+        // Driver's assigned loads
         query = `
           SELECT l.*, 
-            CONCAT(u.first_name, ' ', u.last_name) as shipper_name
+            CONCAT(u.first_name, ' ', u.last_name) as shipper_name,
+            o.name as shipper_org_name
           FROM loads l
           JOIN users u ON l.shipper_id = u.id
+          LEFT JOIN orgs o ON l.posted_by_org_id = o.id
           WHERE l.driver_id = $1
           ${status ? 'AND l.status = $2' : ''}
           ORDER BY l.created_at DESC
@@ -276,6 +393,12 @@ router.get('/', authenticate, async (req, res) => {
     res.json({
       loads: result.rows.map(formatLoadResponse),
       count: result.rows.length,
+      org: userOrg ? {
+        id: userOrg.org_id,
+        name: userOrg.org_name,
+        type: userOrg.org_type,
+        role: userOrg.role,
+      } : null,
     });
   } catch (error) {
     console.error('[Loads] List error:', error);
@@ -285,17 +408,24 @@ router.get('/', authenticate, async (req, res) => {
 
 /**
  * GET /loads/available
- * Get available loads for drivers
+ * Get available loads for carriers/dispatchers/drivers
  */
 router.get('/available', authenticate, async (req, res) => {
   try {
     const { limit = 20, offset = 0 } = req.query;
 
+    // Get user's org to check verification status for priority matching
+    const userOrg = await getUserPrimaryOrg(req.user.id);
+
     const result = await pool.query(
       `SELECT l.*, 
-        CONCAT(u.first_name, ' ', u.last_name) as shipper_name
+        CONCAT(u.first_name, ' ', u.last_name) as shipper_name,
+        o.name as shipper_org_name,
+        o.org_type as shipper_org_type,
+        o.verification_status as shipper_verification
        FROM loads l
        JOIN users u ON l.shipper_id = u.id
+       LEFT JOIN orgs o ON l.posted_by_org_id = o.id
        WHERE l.status = 'posted'
        ORDER BY l.posted_at DESC
        LIMIT $1 OFFSET $2`,
@@ -303,8 +433,19 @@ router.get('/available', authenticate, async (req, res) => {
     );
 
     res.json({
-      loads: result.rows.map(formatLoadResponse),
+      loads: result.rows.map(load => ({
+        ...formatLoadResponse(load),
+        shipperOrgName: load.shipper_org_name,
+        shipperOrgType: load.shipper_org_type,
+        shipperVerified: load.shipper_verification === 'verified',
+      })),
       count: result.rows.length,
+      userOrg: userOrg ? {
+        id: userOrg.org_id,
+        name: userOrg.org_name,
+        type: userOrg.org_type,
+        verified: userOrg.verification_status === 'verified',
+      } : null,
     });
   } catch (error) {
     console.error('[Loads] Available error:', error);
@@ -324,9 +465,12 @@ router.get('/active', authenticate, async (req, res) => {
         CONCAT(shipper.first_name, ' ', shipper.last_name) as shipper_name,
         shipper.phone as shipper_phone,
         shipper.company_name as shipper_company,
-        shipper.id as shipper_user_id
+        shipper.id as shipper_user_id,
+        o.name as shipper_org_name,
+        o.org_type as shipper_org_type
        FROM loads l
        JOIN users shipper ON l.shipper_id = shipper.id
+       LEFT JOIN orgs o ON l.posted_by_org_id = o.id
        WHERE l.driver_id = $1 
          AND l.status IN ('assigned', 'accepted', 'en_route_pickup', 'at_pickup', 'picked_up', 'en_route_delivery', 'at_delivery')
        ORDER BY l.assigned_at DESC
@@ -346,7 +490,9 @@ router.get('/active', authenticate, async (req, res) => {
         shipper: {
           id: load.shipper_user_id,
           name: load.shipper_name,
-          companyName: load.shipper_company,
+          companyName: load.shipper_company || load.shipper_org_name,
+          orgName: load.shipper_org_name,
+          orgType: load.shipper_org_type,
           phone: load.shipper_phone,
         }
       }
@@ -360,25 +506,49 @@ router.get('/active', authenticate, async (req, res) => {
 /**
  * GET /loads/company
  * Get all loads for the user's company (team view)
- * MUST BE BEFORE /:id route!
+ * DEPRECATED: Use GET /loads with org context instead
+ * Kept for backward compatibility
  */
 router.get('/company', authenticate, async (req, res) => {
   try {
     const { status, limit = 50, offset = 0 } = req.query;
 
-    // Get user's company_id
+    // Get user's org
+    const userOrg = await getUserPrimaryOrg(req.user.id);
+    
+    // Also check legacy company_id
     const userResult = await pool.query(
       'SELECT company_id FROM users WHERE id = $1',
       [req.user.id]
     );
-
     const companyId = userResult.rows[0]?.company_id;
 
     let query;
     let params;
 
-    if (companyId) {
-      // Get all loads from users in the same company
+    if (userOrg?.org_id) {
+      // New org model - get all loads from org
+      query = `
+        SELECT l.*, 
+          CONCAT(shipper.first_name, ' ', shipper.last_name) as shipper_name,
+          shipper.email as shipper_email,
+          shipper.department as shipper_department,
+          CONCAT(driver.first_name, ' ', driver.last_name) as driver_name,
+          driver.phone as driver_phone,
+          CONCAT(poster.first_name, ' ', poster.last_name) as posted_by_name
+        FROM loads l
+        JOIN users shipper ON l.shipper_id = shipper.id
+        LEFT JOIN users driver ON l.driver_id = driver.id
+        LEFT JOIN users poster ON l.posted_by_user_id = poster.id
+        WHERE l.posted_by_org_id = $1
+        ${status ? 'AND l.status = $2' : ''}
+        ORDER BY l.created_at DESC
+        LIMIT $${status ? 3 : 2} OFFSET $${status ? 4 : 3}`;
+      params = status
+        ? [userOrg.org_id, status, limit, offset]
+        : [userOrg.org_id, limit, offset];
+    } else if (companyId) {
+      // Legacy company model
       query = `
         SELECT l.*, 
           CONCAT(shipper.first_name, ' ', shipper.last_name) as shipper_name,
@@ -423,7 +593,17 @@ router.get('/company', authenticate, async (req, res) => {
     let statsQuery;
     let statsParams;
 
-    if (companyId) {
+    if (userOrg?.org_id) {
+      statsQuery = `
+        SELECT 
+          COUNT(*) as total,
+          COUNT(*) FILTER (WHERE l.status NOT IN ('delivered', 'cancelled', 'completed')) as active,
+          COUNT(*) FILTER (WHERE l.status IN ('delivered', 'completed')) as completed,
+          COALESCE(SUM(l.price) FILTER (WHERE l.status IN ('delivered', 'completed')), 0) as total_spent
+        FROM loads l
+        WHERE l.posted_by_org_id = $1`;
+      statsParams = [userOrg.org_id];
+    } else if (companyId) {
       statsQuery = `
         SELECT 
           COUNT(*) as total,
@@ -455,6 +635,7 @@ router.get('/company', authenticate, async (req, res) => {
         shipperName: load.shipper_name,
         shipperEmail: load.shipper_email,
         shipperDepartment: load.shipper_department,
+        postedByName: load.posted_by_name,
       })),
       count: result.rows.length,
       stats: {
@@ -462,7 +643,12 @@ router.get('/company', authenticate, async (req, res) => {
         active: parseInt(stats.active) || 0,
         completed: parseInt(stats.completed) || 0,
         totalSpent: parseFloat(stats.total_spent) || 0,
-      }
+      },
+      org: userOrg ? {
+        id: userOrg.org_id,
+        name: userOrg.org_name,
+        type: userOrg.org_type,
+      } : null,
     });
   } catch (error) {
     console.error('[Loads] Company loads error:', error);
@@ -489,10 +675,14 @@ router.get('/:id', authenticate, async (req, res) => {
         driver.license_plate as driver_license_plate,
         driver.driver_lat as driver_current_lat,
         driver.driver_lng as driver_current_lng,
-        driver.location_updated_at as driver_location_updated_at
+        driver.location_updated_at as driver_location_updated_at,
+        poster_org.name as poster_org_name,
+        poster_org.org_type as poster_org_type,
+        poster_org.verification_status as poster_verification
        FROM loads l
        JOIN users shipper ON l.shipper_id = shipper.id
        LEFT JOIN users driver ON l.driver_id = driver.id
+       LEFT JOIN orgs poster_org ON l.posted_by_org_id = poster_org.id
        WHERE l.id = $1`,
       [req.params.id]
     );
@@ -503,12 +693,14 @@ router.get('/:id', authenticate, async (req, res) => {
 
     const load = result.rows[0];
 
-    // Check authorization
+    // Check authorization - also check org membership
+    const userOrg = await getUserPrimaryOrg(req.user.id);
     const isShipper = load.shipper_id === req.user.id;
     const isDriver = load.driver_id === req.user.id;
+    const isOrgMember = userOrg?.org_id && load.posted_by_org_id === userOrg.org_id;
     const isAvailable = load.status === 'posted';
 
-    if (!isShipper && !isDriver && !isAvailable) {
+    if (!isShipper && !isDriver && !isOrgMember && !isAvailable) {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -520,6 +712,12 @@ router.get('/:id', authenticate, async (req, res) => {
         name: load.shipper_name,
         phone: load.shipper_phone,
       },
+      posterOrg: load.posted_by_org_id ? {
+        id: load.posted_by_org_id,
+        name: load.poster_org_name,
+        type: load.poster_org_type,
+        verified: load.poster_verification === 'verified',
+      } : null,
     };
 
     // Include driver info with current location if driver is assigned
@@ -555,7 +753,7 @@ router.post('/:id/cancel',
     try {
       const { reason } = req.body;
 
-      // Get load and verify ownership
+      // Get load and verify ownership (including org membership)
       const checkResult = await pool.query(
         'SELECT * FROM loads WHERE id = $1',
         [req.params.id]
@@ -567,9 +765,14 @@ router.post('/:id/cancel',
 
       const load = checkResult.rows[0];
 
-      // Only shipper can cancel
-      if (load.shipper_id !== req.user.id) {
-        return res.status(403).json({ error: 'Only the shipper can cancel this load' });
+      // Check authorization - owner or org member with permission
+      const userOrg = await getUserPrimaryOrg(req.user.id);
+      const isOwner = load.shipper_id === req.user.id;
+      const isOrgAdmin = userOrg?.org_id === load.posted_by_org_id && 
+                         ['shipper_admin', 'broker_admin'].includes(userOrg.role);
+
+      if (!isOwner && !isOrgAdmin) {
+        return res.status(403).json({ error: 'Only the shipper or org admin can cancel this load' });
       }
 
       // Can only cancel if not yet picked up
@@ -626,6 +829,19 @@ router.post('/:id/accept',
         return res.status(400).json({ error: 'Load not available' });
       }
 
+      const load = checkResult.rows[0];
+
+      // Check if load requires verified carrier
+      if (load.verified_only) {
+        const userOrg = await getUserPrimaryOrg(req.user.id);
+        if (!userOrg || userOrg.verification_status !== 'verified') {
+          return res.status(403).json({ 
+            error: 'This load requires a verified carrier',
+            code: 'VERIFICATION_REQUIRED'
+          });
+        }
+      }
+
       // Assign load to driver
       const result = await pool.query(
         `UPDATE loads 
@@ -639,13 +855,13 @@ router.post('/:id/accept',
       );
 
       // Notify shipper that driver accepted
-      const load = result.rows[0];
+      const updatedLoad = result.rows[0];
       const driverResult = await pool.query('SELECT first_name, last_name FROM users WHERE id = $1', [req.user.id]);
       const driverName = driverResult.rows[0] ? `${driverResult.rows[0].first_name} ${driverResult.rows[0].last_name || ''}`.trim() : 'Driver';
       
-      notificationService.notifyShipperDriverAccepted(load.shipper_id, driverName, {
-        loadId: load.id,
-        deliveryCity: load.delivery_city,
+      notificationService.notifyShipperDriverAccepted(updatedLoad.shipper_id, driverName, {
+        loadId: updatedLoad.id,
+        deliveryCity: updatedLoad.delivery_city,
       }).catch(err => console.error('[Notifications] Error:', err));
 
       res.json({
@@ -750,11 +966,11 @@ router.put('/:id/location',
         return res.status(404).json({ error: 'Load not found or access denied' });
       }
 
-      // Update driver location in driver_profiles
+      // Update driver location in users table (not driver_profiles)
       await pool.query(
-        `UPDATE driver_profiles 
-         SET current_lat = $1, current_lng = $2, location_updated_at = CURRENT_TIMESTAMP
-         WHERE user_id = $3`,
+        `UPDATE users 
+         SET driver_lat = $1, driver_lng = $2, location_updated_at = CURRENT_TIMESTAMP
+         WHERE id = $3`,
         [lat, lng, req.user.id]
       );
 
@@ -765,84 +981,6 @@ router.put('/:id/location',
     }
   }
 );
-
-// Helper: Format load response
-function formatLoadResponse(load, detailed = false) {
-  const response = {
-    id: load.id,
-    status: load.status,
-    loadType: load.load_type || 'standard',
-    description: load.description,
-    weightLbs: load.weight_lbs,
-    pieces: load.pieces || 1,
-    pickupCity: load.pickup_city,
-    pickupState: load.pickup_state,
-    deliveryCity: load.delivery_city,
-    deliveryState: load.delivery_state,
-    distanceMiles: parseFloat(load.distance_miles) || 0,
-    price: parseFloat(load.price) || 0,
-    expeditedFee: parseFloat(load.expedited_fee) || 0,
-    driverPayout: parseFloat(load.driver_payout) || 0,
-    postedAt: load.posted_at,
-    createdAt: load.created_at,
-    shipperName: load.shipper_name,
-    driverName: load.driver_name,
-    driverPhone: load.driver_phone,
-    shipperRated: load.shipper_rated || false,
-    equipmentType: load.equipment_type || load.vehicle_type_required,
-    vehicleTypeRequired: load.vehicle_type_required,
-  };
-
-  if (detailed) {
-    Object.assign(response, {
-      // Pickup details
-      pickupAddress: load.pickup_address,
-      pickupZip: load.pickup_zip,
-      pickupLat: parseFloat(load.pickup_lat),
-      pickupLng: parseFloat(load.pickup_lng),
-      pickupCompanyName: load.pickup_company_name,
-      pickupContactName: load.pickup_contact_name,
-      pickupContactPhone: load.pickup_contact_phone,
-      pickupDate: load.pickup_date,
-      pickupTimeStart: load.pickup_time_start,
-      pickupTimeEnd: load.pickup_time_end,
-      pickupInstructions: load.pickup_instructions || load.pickup_notes,
-      // Delivery details
-      deliveryAddress: load.delivery_address,
-      deliveryZip: load.delivery_zip,
-      deliveryLat: parseFloat(load.delivery_lat),
-      deliveryLng: parseFloat(load.delivery_lng),
-      deliveryCompanyName: load.delivery_company_name,
-      deliveryContactName: load.delivery_contact_name,
-      deliveryContactPhone: load.delivery_contact_phone,
-      deliveryDate: load.delivery_date,
-      deliveryTimeStart: load.delivery_time_start,
-      deliveryTimeEnd: load.delivery_time_end,
-      deliveryInstructions: load.delivery_instructions || load.delivery_notes,
-      // Cargo details
-      dimensions: load.dimensions,
-      isFragile: load.is_fragile,
-      requiresLiftgate: load.requires_liftgate,
-      requiresPalletJack: load.requires_pallet_jack,
-      specialRequirements: load.special_requirements,
-      // Pricing
-      platformFee: parseFloat(load.platform_fee) || 0,
-      // People
-      shipperId: load.shipper_id,
-      driverId: load.driver_id,
-      shipperPhone: load.shipper_phone,
-      // Timestamps
-      assignedAt: load.assigned_at,
-      pickedUpAt: load.picked_up_at,
-      deliveredAt: load.delivered_at,
-      completedAt: load.completed_at,
-      cancelledAt: load.cancelled_at,
-    });
-  }
-
-  return response;
-}
-
 
 /**
  * POST /loads/:id/rate
@@ -861,11 +999,24 @@ router.post('/:id/rate',
         return res.status(400).json({ error: 'Rating must be between 1 and 5' });
       }
 
-      // Verify load exists and belongs to shipper
-      const loadCheck = await pool.query(
-        `SELECT * FROM loads WHERE id = $1 AND shipper_id = $2 AND status IN ('delivered', 'completed')`,
-        [loadId, shipperId]
-      );
+      // Verify load exists and belongs to shipper (or shipper's org)
+      const userOrg = await getUserPrimaryOrg(req.user.id);
+      
+      let loadCheck;
+      if (userOrg?.org_id) {
+        loadCheck = await pool.query(
+          `SELECT * FROM loads 
+           WHERE id = $1 
+           AND (shipper_id = $2 OR posted_by_org_id = $3)
+           AND status IN ('delivered', 'completed')`,
+          [loadId, shipperId, userOrg.org_id]
+        );
+      } else {
+        loadCheck = await pool.query(
+          `SELECT * FROM loads WHERE id = $1 AND shipper_id = $2 AND status IN ('delivered', 'completed')`,
+          [loadId, shipperId]
+        );
+      }
 
       if (loadCheck.rows.length === 0) {
         return res.status(404).json({ error: 'Load not found or not eligible for rating' });
@@ -925,9 +1076,99 @@ router.post('/:id/rate',
   }
 );
 
+// Helper: Format load response
+function formatLoadResponse(load, detailed = false) {
+  const response = {
+    id: load.id,
+    status: load.status,
+    loadType: load.load_type || 'standard',
+    description: load.description,
+    weightLbs: load.weight_lbs,
+    pieces: load.pieces || 1,
+    pickupCity: load.pickup_city,
+    pickupState: load.pickup_state,
+    deliveryCity: load.delivery_city,
+    deliveryState: load.delivery_state,
+    distanceMiles: parseFloat(load.distance_miles) || 0,
+    price: parseFloat(load.price) || 0,
+    expeditedFee: parseFloat(load.expedited_fee) || 0,
+    driverPayout: parseFloat(load.driver_payout) || 0,
+    carrierPay: parseFloat(load.carrier_pay) || null,
+    postedAt: load.posted_at,
+    createdAt: load.created_at,
+    shipperName: load.shipper_name,
+    driverName: load.driver_name,
+    driverPhone: load.driver_phone,
+    shipperRated: load.shipper_rated || false,
+    equipmentType: load.equipment_type || load.vehicle_type_required,
+    vehicleTypeRequired: load.vehicle_type_required,
+    // NEW: Org context
+    postedByOrgId: load.posted_by_org_id,
+    postedByUserId: load.posted_by_user_id,
+    // NEW: Booking options
+    allowOffers: load.allow_offers !== false,
+    allowBookNow: load.allow_book_now !== false,
+    minOffer: load.min_offer ? parseFloat(load.min_offer) : null,
+    verifiedOnly: load.verified_only || false,
+    trackingRequired: load.tracking_required !== false,
+  };
+
+  // Broker fields (only if present)
+  if (load.customer_name) {
+    response.customerName = load.customer_name;
+    response.customerLoadNumber = load.customer_load_number;
+    response.customerPo = load.customer_po;
+    response.customerRate = load.customer_rate ? parseFloat(load.customer_rate) : null;
+  }
+
+  if (detailed) {
+    Object.assign(response, {
+      // Pickup details
+      pickupAddress: load.pickup_address,
+      pickupZip: load.pickup_zip,
+      pickupLat: load.pickup_lat ? parseFloat(load.pickup_lat) : null,
+      pickupLng: load.pickup_lng ? parseFloat(load.pickup_lng) : null,
+      pickupCompanyName: load.pickup_company_name,
+      pickupContactName: load.pickup_contact_name,
+      pickupContactPhone: load.pickup_contact_phone,
+      pickupDate: load.pickup_date,
+      pickupTimeStart: load.pickup_time_start,
+      pickupTimeEnd: load.pickup_time_end,
+      pickupInstructions: load.pickup_instructions || load.pickup_notes,
+      // Delivery details
+      deliveryAddress: load.delivery_address,
+      deliveryZip: load.delivery_zip,
+      deliveryLat: load.delivery_lat ? parseFloat(load.delivery_lat) : null,
+      deliveryLng: load.delivery_lng ? parseFloat(load.delivery_lng) : null,
+      deliveryCompanyName: load.delivery_company_name,
+      deliveryContactName: load.delivery_contact_name,
+      deliveryContactPhone: load.delivery_contact_phone,
+      deliveryDate: load.delivery_date,
+      deliveryTimeStart: load.delivery_time_start,
+      deliveryTimeEnd: load.delivery_time_end,
+      deliveryInstructions: load.delivery_instructions || load.delivery_notes,
+      // Cargo details
+      dimensions: load.dimensions,
+      isFragile: load.is_fragile,
+      requiresLiftgate: load.requires_liftgate,
+      requiresPalletJack: load.requires_pallet_jack,
+      specialRequirements: load.special_requirements,
+      // Pricing
+      platformFee: parseFloat(load.platform_fee) || 0,
+      // People
+      shipperId: load.shipper_id,
+      driverId: load.driver_id,
+      shipperPhone: load.shipper_phone,
+      // Timestamps
+      assignedAt: load.assigned_at,
+      pickedUpAt: load.picked_up_at,
+      deliveredAt: load.delivered_at,
+      completedAt: load.completed_at,
+      cancelledAt: load.cancelled_at,
+    });
+  }
+
+  return response;
+}
+
 module.exports = router;
-
-
-
-
-
