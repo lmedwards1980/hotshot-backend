@@ -154,11 +154,11 @@ router.get('/carriers/search', authenticate, requireBroker, async (req, res) => 
         SELECT 
           o.id, o.name, o.mc_number, o.dot_number, o.city, o.state,
           o.verification_status, o.loads_completed, o.on_time_rate,
-          EXISTS(
-            SELECT 1 FROM broker_carriers bc 
-            WHERE bc.broker_org_id = $1 AND bc.carrier_org_id = o.id
-          ) as already_in_network
+          bc.id as network_record_id,
+          bc.status as network_status,
+          CASE WHEN bc.id IS NOT NULL THEN true ELSE false END as already_in_network
         FROM orgs o
+        LEFT JOIN broker_carriers bc ON bc.carrier_org_id = o.id AND bc.broker_org_id = $1
         WHERE o.org_type = 'carrier' AND o.is_active = true
           ${q.trim() ? `AND (
             o.name ILIKE $2 OR 
@@ -356,7 +356,7 @@ router.get('/carriers/:id', authenticate, requireBroker, async (req, res) => {
 
 /**
  * POST /broker/carriers
- * Add carrier to network (invite by MC# or org ID)
+ * Send invitation to carrier (requires carrier acceptance)
  */
 router.post('/carriers', authenticate, requireBroker, requireBrokerAdmin, async (req, res) => {
   const client = await pool.connect();
@@ -381,7 +381,7 @@ router.post('/carriers', authenticate, requireBroker, requireBrokerAdmin, async 
       carrierOrg = result.rows[0];
     }
 
-    // Check for existing relationship
+    // Check for existing relationship or pending invite
     if (carrierOrg) {
       const existing = await pool.query(
         `SELECT id, status FROM broker_carriers WHERE broker_org_id = $1 AND carrier_org_id = $2`,
@@ -389,48 +389,52 @@ router.post('/carriers', authenticate, requireBroker, requireBrokerAdmin, async 
       );
 
       if (existing.rows.length > 0) {
-        return res.status(409).json({ 
-          error: 'Carrier already in your network',
-          existingStatus: existing.rows[0].status,
-          existingId: existing.rows[0].id
-        });
+        const status = existing.rows[0].status;
+        if (status === 'active') {
+          return res.status(409).json({ error: 'Carrier already in your network' });
+        } else if (status === 'pending_carrier') {
+          return res.status(409).json({ error: 'Invitation already sent, waiting for carrier to accept' });
+        } else if (status === 'pending_broker') {
+          return res.status(409).json({ error: 'Carrier has requested to join - review in your dashboard' });
+        }
       }
     }
 
     await client.query('BEGIN');
 
     if (carrierOrg) {
-      // Carrier exists on platform - create relationship
+      // Carrier exists on platform - create pending invite
       const result = await client.query(`
         INSERT INTO broker_carriers (
           broker_org_id, carrier_org_id, status, invited_by,
           primary_contact_name, notes
-        ) VALUES ($1, $2, 'pending', $3, $4, $5)
+        ) VALUES ($1, $2, 'pending_carrier', $3, $4, $5)
+        ON CONFLICT (broker_org_id, carrier_org_id) 
+        DO UPDATE SET status = 'pending_carrier', invited_by = $3, notes = $5, updated_at = NOW()
         RETURNING *
       `, [req.brokerOrg.id, carrierOrg.id, req.user.id, contactName || null, message || null]);
 
       await client.query('COMMIT');
 
-      // TODO: Send notification to carrier about broker invite
+      // TODO: Send push notification to carrier about broker invite
 
       res.status(201).json({
-        message: 'Carrier invitation sent',
-        carrier: {
+        message: 'Invitation sent - waiting for carrier to accept',
+        invite: {
           id: result.rows[0].id,
           carrierOrgId: carrierOrg.id,
           carrierName: carrierOrg.name,
-          status: 'pending'
+          status: 'pending_carrier'
         }
       });
     } else {
-      // Carrier not on platform - create placeholder invite
-      // Store as external invite (carrier doesn't have org yet)
+      // Carrier not on platform - create external invite placeholder
       const result = await client.query(`
         INSERT INTO broker_carriers (
           broker_org_id, carrier_org_id, status, invited_by,
           primary_contact_name, primary_contact_email, notes,
           external_mc_number, external_company_name
-        ) VALUES ($1, NULL, 'invited', $2, $3, $4, $5, $6, $7)
+        ) VALUES ($1, NULL, 'external_invite', $2, $3, $4, $5, $6, $7)
         RETURNING *
       `, [
         req.brokerOrg.id, req.user.id, contactName || null, 
@@ -443,9 +447,9 @@ router.post('/carriers', authenticate, requireBroker, requireBrokerAdmin, async 
 
       res.status(201).json({
         message: email ? 'Invitation email sent' : 'Carrier added for later invitation',
-        carrier: {
+        invite: {
           id: result.rows[0].id,
-          status: 'invited',
+          status: 'external_invite',
           externalMcNumber: mcNumber,
           externalCompanyName: companyName
         }
@@ -1297,5 +1301,430 @@ function formatConnectionRequestResponse(row) {
     createdAt: row.created_at,
   };
 }
+
+// ============================================
+// CARRIER ROUTES - Managing broker relationships
+// ============================================
+
+/**
+ * Middleware: Verify user is a carrier
+ */
+const requireCarrier = async (req, res, next) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        o.id as org_id,
+        o.org_type,
+        o.name as org_name,
+        o.mc_number,
+        m.role,
+        m.permissions
+      FROM memberships m
+      JOIN orgs o ON m.org_id = o.id
+      WHERE m.user_id = $1 AND m.is_active = true AND o.is_active = true
+      ORDER BY m.is_primary DESC
+      LIMIT 1
+    `, [req.user.id]);
+
+    if (result.rows.length === 0) {
+      return res.status(403).json({ error: 'You must belong to an organization' });
+    }
+
+    const org = result.rows[0];
+
+    if (org.org_type !== 'carrier') {
+      return res.status(403).json({ error: 'This endpoint is for carriers only' });
+    }
+
+    req.carrierOrg = {
+      id: org.org_id,
+      name: org.org_name,
+      type: org.org_type,
+      mcNumber: org.mc_number,
+      role: org.role,
+      permissions: org.permissions
+    };
+
+    next();
+  } catch (error) {
+    console.error('[Carrier Middleware] Error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+};
+
+/**
+ * GET /broker/carrier/invites
+ * Get broker invites for current carrier (pending_carrier status)
+ */
+router.get('/carrier/invites', authenticate, requireCarrier, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        bc.id,
+        bc.broker_org_id,
+        bc.status,
+        bc.notes as message,
+        bc.created_at,
+        bo.name as broker_name,
+        bo.mc_number as broker_mc,
+        bo.city as broker_city,
+        bo.state as broker_state,
+        bo.email as broker_email,
+        u.first_name as invited_by_first,
+        u.last_name as invited_by_last
+      FROM broker_carriers bc
+      JOIN orgs bo ON bc.broker_org_id = bo.id
+      LEFT JOIN users u ON bc.invited_by = u.id
+      WHERE bc.carrier_org_id = $1 AND bc.status = 'pending_carrier'
+      ORDER BY bc.created_at DESC
+    `, [req.carrierOrg.id]);
+
+    res.json({
+      invites: result.rows.map(row => ({
+        id: row.id,
+        brokerOrgId: row.broker_org_id,
+        brokerName: row.broker_name,
+        brokerMc: row.broker_mc,
+        brokerCity: row.broker_city,
+        brokerState: row.broker_state,
+        brokerEmail: row.broker_email,
+        message: row.message,
+        invitedBy: row.invited_by_first ? `${row.invited_by_first} ${row.invited_by_last}` : null,
+        createdAt: row.created_at
+      }))
+    });
+  } catch (error) {
+    console.error('[Carrier] Get invites error:', error);
+    res.status(500).json({ error: 'Failed to get broker invites' });
+  }
+});
+
+/**
+ * PUT /broker/carrier/invites/:id/accept
+ * Accept broker invite
+ */
+router.put('/carrier/invites/:id/accept', authenticate, requireCarrier, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Verify invite belongs to this carrier and is pending
+    const invite = await pool.query(`
+      SELECT * FROM broker_carriers 
+      WHERE id = $1 AND carrier_org_id = $2 AND status = 'pending_carrier'
+    `, [id, req.carrierOrg.id]);
+
+    if (invite.rows.length === 0) {
+      return res.status(404).json({ error: 'Invite not found or already processed' });
+    }
+
+    // Accept the invite
+    await pool.query(`
+      UPDATE broker_carriers 
+      SET status = 'active', accepted_at = NOW(), updated_at = NOW()
+      WHERE id = $1
+    `, [id]);
+
+    // TODO: Send notification to broker that carrier accepted
+
+    res.json({ message: 'Invitation accepted - you are now connected with this broker' });
+  } catch (error) {
+    console.error('[Carrier] Accept invite error:', error);
+    res.status(500).json({ error: 'Failed to accept invite' });
+  }
+});
+
+/**
+ * PUT /broker/carrier/invites/:id/decline
+ * Decline broker invite
+ */
+router.put('/carrier/invites/:id/decline', authenticate, requireCarrier, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body;
+
+    // Verify invite belongs to this carrier and is pending
+    const invite = await pool.query(`
+      SELECT * FROM broker_carriers 
+      WHERE id = $1 AND carrier_org_id = $2 AND status = 'pending_carrier'
+    `, [id, req.carrierOrg.id]);
+
+    if (invite.rows.length === 0) {
+      return res.status(404).json({ error: 'Invite not found or already processed' });
+    }
+
+    // Decline the invite
+    await pool.query(`
+      UPDATE broker_carriers 
+      SET status = 'declined', decline_reason = $2, updated_at = NOW()
+      WHERE id = $1
+    `, [id, reason || null]);
+
+    // TODO: Send notification to broker that carrier declined
+
+    res.json({ message: 'Invitation declined' });
+  } catch (error) {
+    console.error('[Carrier] Decline invite error:', error);
+    res.status(500).json({ error: 'Failed to decline invite' });
+  }
+});
+
+/**
+ * GET /broker/carrier/brokers
+ * Get list of brokers carrier is connected to (active relationships)
+ */
+router.get('/carrier/brokers', authenticate, requireCarrier, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        bc.id,
+        bc.broker_org_id,
+        bc.status,
+        bc.loads_completed,
+        bc.is_preferred,
+        bc.created_at,
+        bo.name as broker_name,
+        bo.mc_number as broker_mc,
+        bo.city as broker_city,
+        bo.state as broker_state,
+        bo.email as broker_email,
+        bo.phone as broker_phone
+      FROM broker_carriers bc
+      JOIN orgs bo ON bc.broker_org_id = bo.id
+      WHERE bc.carrier_org_id = $1 AND bc.status = 'active'
+      ORDER BY bc.loads_completed DESC, bc.created_at DESC
+    `, [req.carrierOrg.id]);
+
+    res.json({
+      brokers: result.rows.map(row => ({
+        id: row.id,
+        brokerOrgId: row.broker_org_id,
+        brokerName: row.broker_name,
+        brokerMc: row.broker_mc,
+        brokerCity: row.broker_city,
+        brokerState: row.broker_state,
+        brokerEmail: row.broker_email,
+        brokerPhone: row.broker_phone,
+        loadsCompleted: row.loads_completed,
+        isPreferred: row.is_preferred,
+        status: row.status,
+        connectedAt: row.created_at
+      }))
+    });
+  } catch (error) {
+    console.error('[Carrier] Get brokers error:', error);
+    res.status(500).json({ error: 'Failed to get broker connections' });
+  }
+});
+
+/**
+ * POST /broker/carrier/request
+ * Carrier requests to join a broker's network
+ */
+router.post('/carrier/request', authenticate, requireCarrier, async (req, res) => {
+  try {
+    const { brokerOrgId, message } = req.body;
+
+    if (!brokerOrgId) {
+      return res.status(400).json({ error: 'Broker org ID is required' });
+    }
+
+    // Verify broker exists
+    const broker = await pool.query(
+      `SELECT * FROM orgs WHERE id = $1 AND org_type = 'broker' AND is_active = true`,
+      [brokerOrgId]
+    );
+
+    if (broker.rows.length === 0) {
+      return res.status(404).json({ error: 'Broker not found' });
+    }
+
+    // Check for existing relationship
+    const existing = await pool.query(
+      `SELECT id, status FROM broker_carriers WHERE broker_org_id = $1 AND carrier_org_id = $2`,
+      [brokerOrgId, req.carrierOrg.id]
+    );
+
+    if (existing.rows.length > 0) {
+      const status = existing.rows[0].status;
+      if (status === 'active') {
+        return res.status(409).json({ error: 'Already connected with this broker' });
+      } else if (status === 'pending_broker') {
+        return res.status(409).json({ error: 'Request already sent, waiting for broker to accept' });
+      } else if (status === 'pending_carrier') {
+        return res.status(409).json({ error: 'Broker has already invited you - check your invites' });
+      }
+    }
+
+    // Create request (pending_broker means waiting for broker approval)
+    const result = await pool.query(`
+      INSERT INTO broker_carriers (
+        broker_org_id, carrier_org_id, status, notes, requested_by
+      ) VALUES ($1, $2, 'pending_broker', $3, $4)
+      ON CONFLICT (broker_org_id, carrier_org_id) 
+      DO UPDATE SET status = 'pending_broker', notes = $3, requested_by = $4, updated_at = NOW()
+      RETURNING *
+    `, [brokerOrgId, req.carrierOrg.id, message || null, req.user.id]);
+
+    // TODO: Send notification to broker about carrier request
+
+    res.status(201).json({
+      message: 'Request sent - waiting for broker to accept',
+      request: {
+        id: result.rows[0].id,
+        brokerOrgId: brokerOrgId,
+        brokerName: broker.rows[0].name,
+        status: 'pending_broker'
+      }
+    });
+  } catch (error) {
+    console.error('[Carrier] Request broker error:', error);
+    res.status(500).json({ error: 'Failed to send request' });
+  }
+});
+
+/**
+ * DELETE /broker/carrier/brokers/:id
+ * Carrier leaves a broker's network
+ */
+router.delete('/carrier/brokers/:id', authenticate, requireCarrier, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(`
+      DELETE FROM broker_carriers 
+      WHERE id = $1 AND carrier_org_id = $2
+      RETURNING *
+    `, [id, req.carrierOrg.id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Broker connection not found' });
+    }
+
+    res.json({ message: 'Disconnected from broker network' });
+  } catch (error) {
+    console.error('[Carrier] Leave broker error:', error);
+    res.status(500).json({ error: 'Failed to leave broker network' });
+  }
+});
+
+/**
+ * GET /broker/carrier-requests
+ * Broker views pending carrier requests (pending_broker status)
+ */
+router.get('/carrier-requests', authenticate, requireBroker, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        bc.id,
+        bc.carrier_org_id,
+        bc.status,
+        bc.notes as message,
+        bc.created_at,
+        co.name as carrier_name,
+        co.mc_number as carrier_mc,
+        co.dot_number as carrier_dot,
+        co.city as carrier_city,
+        co.state as carrier_state,
+        co.loads_completed,
+        co.on_time_rate,
+        u.first_name as requested_by_first,
+        u.last_name as requested_by_last
+      FROM broker_carriers bc
+      JOIN orgs co ON bc.carrier_org_id = co.id
+      LEFT JOIN users u ON bc.requested_by = u.id
+      WHERE bc.broker_org_id = $1 AND bc.status = 'pending_broker'
+      ORDER BY bc.created_at DESC
+    `, [req.brokerOrg.id]);
+
+    res.json({
+      requests: result.rows.map(row => ({
+        id: row.id,
+        carrierOrgId: row.carrier_org_id,
+        carrierName: row.carrier_name,
+        carrierMc: row.carrier_mc,
+        carrierDot: row.carrier_dot,
+        carrierCity: row.carrier_city,
+        carrierState: row.carrier_state,
+        loadsCompleted: row.loads_completed,
+        onTimeRate: row.on_time_rate,
+        message: row.message,
+        requestedBy: row.requested_by_first ? `${row.requested_by_first} ${row.requested_by_last}` : null,
+        createdAt: row.created_at
+      }))
+    });
+  } catch (error) {
+    console.error('[Broker] Get carrier requests error:', error);
+    res.status(500).json({ error: 'Failed to get carrier requests' });
+  }
+});
+
+/**
+ * PUT /broker/carrier-requests/:id/accept
+ * Broker accepts carrier request
+ */
+router.put('/carrier-requests/:id/accept', authenticate, requireBroker, requireBrokerAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Verify request belongs to this broker and is pending
+    const request = await pool.query(`
+      SELECT * FROM broker_carriers 
+      WHERE id = $1 AND broker_org_id = $2 AND status = 'pending_broker'
+    `, [id, req.brokerOrg.id]);
+
+    if (request.rows.length === 0) {
+      return res.status(404).json({ error: 'Request not found or already processed' });
+    }
+
+    // Accept the request
+    await pool.query(`
+      UPDATE broker_carriers 
+      SET status = 'active', accepted_at = NOW(), accepted_by = $2, updated_at = NOW()
+      WHERE id = $1
+    `, [id, req.user.id]);
+
+    // TODO: Send notification to carrier that broker accepted
+
+    res.json({ message: 'Carrier request accepted - they are now in your network' });
+  } catch (error) {
+    console.error('[Broker] Accept carrier request error:', error);
+    res.status(500).json({ error: 'Failed to accept request' });
+  }
+});
+
+/**
+ * PUT /broker/carrier-requests/:id/decline
+ * Broker declines carrier request
+ */
+router.put('/carrier-requests/:id/decline', authenticate, requireBroker, requireBrokerAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body;
+
+    // Verify request belongs to this broker and is pending
+    const request = await pool.query(`
+      SELECT * FROM broker_carriers 
+      WHERE id = $1 AND broker_org_id = $2 AND status = 'pending_broker'
+    `, [id, req.brokerOrg.id]);
+
+    if (request.rows.length === 0) {
+      return res.status(404).json({ error: 'Request not found or already processed' });
+    }
+
+    // Decline the request
+    await pool.query(`
+      UPDATE broker_carriers 
+      SET status = 'declined', decline_reason = $2, updated_at = NOW()
+      WHERE id = $1
+    `, [id, reason || null]);
+
+    // TODO: Send notification to carrier that broker declined
+
+    res.json({ message: 'Carrier request declined' });
+  } catch (error) {
+    console.error('[Broker] Decline carrier request error:', error);
+    res.status(500).json({ error: 'Failed to decline request' });
+  }
+});
 
 module.exports = router;
