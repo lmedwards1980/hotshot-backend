@@ -523,6 +523,29 @@ router.put('/carriers/:id', authenticate, requireBroker, requireBrokerAdmin, asy
 });
 
 /**
+ * DELETE /broker/carriers/:id
+ * Remove carrier from network (or cancel pending invite)
+ */
+router.delete('/carriers/:id', authenticate, requireBroker, requireBrokerAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      DELETE FROM broker_carriers 
+      WHERE id = $1 AND broker_org_id = $2
+      RETURNING *
+    `, [req.params.id, req.brokerOrg.id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Carrier not found in your network' });
+    }
+
+    res.json({ message: 'Carrier removed from network' });
+  } catch (error) {
+    console.error('[Broker] Delete carrier error:', error);
+    res.status(500).json({ error: 'Failed to remove carrier' });
+  }
+});
+
+/**
  * PUT /broker/carriers/:id/block
  * Block a carrier
  */
