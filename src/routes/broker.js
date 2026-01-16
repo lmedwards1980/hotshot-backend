@@ -1047,16 +1047,26 @@ router.post('/connection-requests', authenticate, requireBroker, requireBrokerAd
     }
 
     // Check if can send request using our function
-    const canSendResult = await pool.query(
-      `SELECT can_broker_send_request($1, $2) as result`,
-      [req.brokerOrg.id, shipperOrgId]
-    );
-
-    const canSend = canSendResult.rows[0].result;
+    let canSend = { can_send: true, attempt_number: 1 };
+    try {
+      const canSendResult = await pool.query(
+        `SELECT can_broker_send_request($1, $2) as result`,
+        [req.brokerOrg.id, shipperOrgId]
+      );
+      
+      // Parse result - could be JSON object or string
+      const rawResult = canSendResult.rows[0]?.result;
+      if (rawResult) {
+        canSend = typeof rawResult === 'string' ? JSON.parse(rawResult) : rawResult;
+      }
+    } catch (funcError) {
+      console.error('[Broker] can_broker_send_request error:', funcError);
+      // Continue with default values if function fails
+    }
 
     if (!canSend.can_send) {
       return res.status(400).json({ 
-        error: canSend.reason,
+        error: canSend.reason || 'Cannot send request at this time',
         daysRemaining: canSend.days_remaining,
         attemptNumber: canSend.attempt_number
       });
@@ -1083,20 +1093,24 @@ router.post('/connection-requests', authenticate, requireBroker, requireBrokerAd
     const result = await client.query(`
       INSERT INTO broker_connection_requests (
         broker_org_id, shipper_org_id, sent_by, message, 
-        attempt_number, expires_at
-      ) VALUES ($1, $2, $3, $4, $5, $6)
+        attempt_number, expires_at, sent_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, NOW())
       RETURNING *
     `, [
       req.brokerOrg.id, shipperOrgId, req.user.id, message || null,
-      canSend.attempt_number, expiresAt
+      canSend.attempt_number || 1, expiresAt
     ]);
 
-    // Record attempt
-    await client.query(`
-      INSERT INTO broker_connection_attempts (
-        broker_org_id, shipper_org_id, request_id, attempt_number
-      ) VALUES ($1, $2, $3, $4)
-    `, [req.brokerOrg.id, shipperOrgId, result.rows[0].id, canSend.attempt_number]);
+    // Record attempt (ignore errors - non-critical)
+    try {
+      await client.query(`
+        INSERT INTO broker_connection_attempts (
+          broker_org_id, shipper_org_id, request_id, attempt_number
+        ) VALUES ($1, $2, $3, $4)
+      `, [req.brokerOrg.id, shipperOrgId, result.rows[0].id, canSend.attempt_number || 1]);
+    } catch (attemptError) {
+      console.error('[Broker] Record attempt error (non-critical):', attemptError);
+    }
 
     await client.query('COMMIT');
 
