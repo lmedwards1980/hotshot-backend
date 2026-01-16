@@ -139,6 +139,157 @@ router.get('/carriers', authenticate, requireBroker, async (req, res) => {
 });
 
 /**
+ * GET /broker/carriers/search
+ * Search carriers on platform (for adding to network)
+ * NOTE: This route MUST come before /carriers/:id
+ */
+router.get('/carriers/search', authenticate, requireBroker, async (req, res) => {
+  try {
+    const { mc, name, city, state, limit = 20 } = req.query;
+
+    if (!mc && !name && !city) {
+      return res.status(400).json({ error: 'Provide mc, name, or city to search' });
+    }
+
+    let whereClause = `WHERE o.org_type = 'carrier' AND o.is_active = true`;
+    const params = [];
+    let paramIndex = 1;
+
+    if (mc) {
+      whereClause += ` AND (o.mc_number ILIKE $${paramIndex} OR o.mc_number ILIKE $${paramIndex + 1})`;
+      params.push(`%${mc}%`, `%MC${mc.replace(/\D/g, '')}%`);
+      paramIndex += 2;
+    }
+
+    if (name) {
+      whereClause += ` AND o.name ILIKE $${paramIndex++}`;
+      params.push(`%${name}%`);
+    }
+
+    if (city) {
+      whereClause += ` AND o.city ILIKE $${paramIndex++}`;
+      params.push(`%${city}%`);
+    }
+
+    if (state) {
+      whereClause += ` AND o.state = $${paramIndex++}`;
+      params.push(state.toUpperCase());
+    }
+
+    params.push(limit);
+
+    const result = await pool.query(`
+      SELECT 
+        o.id, o.name, o.mc_number, o.dot_number, o.city, o.state,
+        o.verification_status, o.loads_completed, o.on_time_rate,
+        EXISTS(
+          SELECT 1 FROM broker_carriers bc 
+          WHERE bc.broker_org_id = $${paramIndex + 1} AND bc.carrier_org_id = o.id
+        ) as already_in_network
+      FROM orgs o
+      ${whereClause}
+      ORDER BY o.loads_completed DESC NULLS LAST
+      LIMIT $${paramIndex}
+    `, [...params, req.brokerOrg.id]);
+
+    res.json({ carriers: result.rows });
+  } catch (error) {
+    console.error('[Broker] Search carriers error:', error);
+    res.status(500).json({ error: 'Failed to search carriers' });
+  }
+});
+
+/**
+ * GET /broker/carriers/org/:orgId
+ * Get carrier org details by org ID (for viewing carriers not yet in network)
+ * NOTE: This route MUST come before /carriers/:id
+ */
+router.get('/carriers/org/:orgId', authenticate, requireBroker, async (req, res) => {
+  try {
+    const { orgId } = req.params;
+
+    // Get org info
+    const orgResult = await pool.query(`
+      SELECT 
+        o.*,
+        (SELECT COUNT(*) FROM memberships WHERE org_id = o.id AND role = 'driver' AND is_active = true) as driver_count
+      FROM orgs o
+      WHERE o.id = $1 AND o.org_type = 'carrier' AND o.is_active = true
+    `, [orgId]);
+
+    if (orgResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Carrier not found' });
+    }
+
+    const org = orgResult.rows[0];
+
+    // Check if already in network
+    const networkResult = await pool.query(`
+      SELECT id, status, is_preferred, loads_completed, notes
+      FROM broker_carriers
+      WHERE broker_org_id = $1 AND carrier_org_id = $2
+    `, [req.brokerOrg.id, orgId]);
+
+    const inNetwork = networkResult.rows.length > 0;
+    const networkRecord = networkResult.rows[0] || null;
+
+    // Get trust signals if available
+    const trustResult = await pool.query(`
+      SELECT * FROM trust_signals WHERE org_id = $1
+    `, [orgId]);
+    const trustSignals = trustResult.rows[0] || null;
+
+    res.json({
+      carrier: {
+        id: org.id,
+        name: org.name,
+        dbaName: org.dba_name,
+        email: org.email,
+        phone: org.phone,
+        address: org.address,
+        city: org.city,
+        state: org.state,
+        zip: org.zip,
+        mcNumber: org.mc_number,
+        dotNumber: org.dot_number,
+        authorityStatus: org.authority_status,
+        verificationStatus: org.verification_status,
+        verifiedAt: org.verified_at,
+        loadsCompleted: org.loads_completed,
+        onTimeRate: org.on_time_rate ? parseFloat(org.on_time_rate) : null,
+        claimRate: org.claim_rate ? parseFloat(org.claim_rate) : null,
+        driverCount: parseInt(org.driver_count) || 0,
+        trustSignals: trustSignals ? {
+          totalLoads: trustSignals.total_loads,
+          completedLoads: trustSignals.completed_loads,
+          cancelledLoads: trustSignals.cancelled_loads,
+          onTimePickups: trustSignals.on_time_pickups,
+          onTimeDeliveries: trustSignals.on_time_deliveries,
+          claimsFiled: trustSignals.claims_filed,
+          claimsPaid: trustSignals.claims_paid,
+          avgCloseoutHours: trustSignals.avg_closeout_hours ? parseFloat(trustSignals.avg_closeout_hours) : null,
+          completionRate: trustSignals.completion_rate ? parseFloat(trustSignals.completion_rate) : null,
+          onTimeRate: trustSignals.on_time_rate ? parseFloat(trustSignals.on_time_rate) : null,
+          claimRate: trustSignals.claim_rate ? parseFloat(trustSignals.claim_rate) : null,
+        } : null,
+      },
+      inNetwork,
+      networkStatus: networkRecord?.status || null,
+      networkRecord: networkRecord ? {
+        id: networkRecord.id,
+        status: networkRecord.status,
+        isPreferred: networkRecord.is_preferred,
+        loadsCompleted: networkRecord.loads_completed,
+        notes: networkRecord.notes,
+      } : null,
+    });
+  } catch (error) {
+    console.error('[Broker] Get carrier org error:', error);
+    res.status(500).json({ error: 'Failed to get carrier' });
+  }
+});
+
+/**
  * GET /broker/carriers/:id
  * Get carrier details
  */
@@ -447,66 +598,6 @@ router.get('/carriers/:id/loads', authenticate, requireBroker, async (req, res) 
   } catch (error) {
     console.error('[Broker] Get carrier loads error:', error);
     res.status(500).json({ error: 'Failed to get loads' });
-  }
-});
-
-/**
- * GET /broker/carriers/search
- * Search carriers on platform (for adding to network)
- */
-router.get('/carriers/search', authenticate, requireBroker, async (req, res) => {
-  try {
-    const { mc, name, city, state, limit = 20 } = req.query;
-
-    if (!mc && !name && !city) {
-      return res.status(400).json({ error: 'Provide mc, name, or city to search' });
-    }
-
-    let whereClause = `WHERE o.org_type = 'carrier' AND o.is_active = true`;
-    const params = [];
-    let paramIndex = 1;
-
-    if (mc) {
-      whereClause += ` AND (o.mc_number ILIKE $${paramIndex} OR o.mc_number ILIKE $${paramIndex + 1})`;
-      params.push(`%${mc}%`, `%MC${mc.replace(/\D/g, '')}%`);
-      paramIndex += 2;
-    }
-
-    if (name) {
-      whereClause += ` AND o.name ILIKE $${paramIndex++}`;
-      params.push(`%${name}%`);
-    }
-
-    if (city) {
-      whereClause += ` AND o.city ILIKE $${paramIndex++}`;
-      params.push(`%${city}%`);
-    }
-
-    if (state) {
-      whereClause += ` AND o.state = $${paramIndex++}`;
-      params.push(state.toUpperCase());
-    }
-
-    params.push(limit);
-
-    const result = await pool.query(`
-      SELECT 
-        o.id, o.name, o.mc_number, o.dot_number, o.city, o.state,
-        o.verification_status, o.loads_completed, o.on_time_rate,
-        EXISTS(
-          SELECT 1 FROM broker_carriers bc 
-          WHERE bc.broker_org_id = $${paramIndex + 1} AND bc.carrier_org_id = o.id
-        ) as already_in_network
-      FROM orgs o
-      ${whereClause}
-      ORDER BY o.loads_completed DESC NULLS LAST
-      LIMIT $${paramIndex}
-    `, [...params, req.brokerOrg.id]);
-
-    res.json({ carriers: result.rows });
-  } catch (error) {
-    console.error('[Broker] Search carriers error:', error);
-    res.status(500).json({ error: 'Failed to search carriers' });
   }
 });
 
