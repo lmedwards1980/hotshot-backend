@@ -1101,15 +1101,17 @@ router.post('/connection-requests', authenticate, requireBroker, requireBrokerAd
       canSend.attempt_number || 1, expiresAt
     ]);
 
-    // Record attempt (ignore errors - non-critical)
+    // Record attempt (non-critical - use savepoint so failure doesn't abort transaction)
     try {
+      await client.query('SAVEPOINT attempt_insert');
       await client.query(`
         INSERT INTO broker_connection_attempts (
           broker_org_id, shipper_org_id, request_id, attempt_number
         ) VALUES ($1, $2, $3, $4)
       `, [req.brokerOrg.id, shipperOrgId, result.rows[0].id, canSend.attempt_number || 1]);
     } catch (attemptError) {
-      console.error('[Broker] Record attempt error (non-critical):', attemptError);
+      console.error('[Broker] Record attempt error (non-critical):', attemptError.message);
+      await client.query('ROLLBACK TO SAVEPOINT attempt_insert');
     }
 
     await client.query('COMMIT');
