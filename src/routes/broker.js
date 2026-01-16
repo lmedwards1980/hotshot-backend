@@ -762,6 +762,84 @@ router.get('/shippers/:id', authenticate, requireBroker, async (req, res) => {
 });
 
 /**
+ * GET /broker/shippers/org/:orgId
+ * Get shipper by org ID (for viewing profiles from discover screen)
+ */
+router.get('/shippers/org/:orgId', authenticate, requireBroker, async (req, res) => {
+  try {
+    const { orgId } = req.params;
+
+    // Get shipper org details
+    const orgResult = await pool.query(`
+      SELECT 
+        o.id, o.name, o.dba_name, o.city, o.state, o.email, o.phone,
+        o.verification_status, o.verified_at, o.payment_terms, o.created_at,
+        u.shipper_score, u.shipper_rating, u.shipper_rating_count,
+        u.shipper_loads_posted, u.shipper_loads_completed,
+        u.shipper_cancellations, u.shipper_disputes, u.shipper_on_time_rate
+      FROM orgs o
+      LEFT JOIN users u ON u.id = (
+        SELECT user_id FROM memberships 
+        WHERE org_id = o.id AND is_primary = true 
+        LIMIT 1
+      )
+      WHERE o.id = $1 AND o.org_type = 'shipper'
+    `, [orgId]);
+
+    if (orgResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Shipper not found' });
+    }
+
+    const shipperOrg = orgResult.rows[0];
+
+    // Check if we have an existing relationship
+    const relationResult = await pool.query(`
+      SELECT id, status FROM broker_shippers 
+      WHERE broker_org_id = $1 AND shipper_org_id = $2
+    `, [req.brokerOrg.id, orgId]);
+
+    // Check for pending connection request
+    const requestResult = await pool.query(`
+      SELECT id, status FROM broker_connection_requests
+      WHERE broker_org_id = $1 AND shipper_org_id = $2 AND status = 'pending'
+    `, [req.brokerOrg.id, orgId]);
+
+    const relationshipStatus = relationResult.rows.length > 0 
+      ? relationResult.rows[0].status 
+      : (requestResult.rows.length > 0 ? 'pending' : null);
+
+    res.json({
+      shipper: {
+        id: shipperOrg.id,
+        name: shipperOrg.name,
+        dbaName: shipperOrg.dba_name,
+        city: shipperOrg.city,
+        state: shipperOrg.state,
+        email: shipperOrg.email,
+        phone: shipperOrg.phone,
+        verificationStatus: shipperOrg.verification_status,
+        verifiedAt: shipperOrg.verified_at,
+        paymentTerms: shipperOrg.payment_terms,
+        createdAt: shipperOrg.created_at,
+        shipperScore: shipperOrg.shipper_score ? parseFloat(shipperOrg.shipper_score) : 5.0,
+        shipperRating: shipperOrg.shipper_rating ? parseFloat(shipperOrg.shipper_rating) : null,
+        shipperRatingCount: shipperOrg.shipper_rating_count || 0,
+        shipperLoadsPosted: shipperOrg.shipper_loads_posted || 0,
+        shipperLoadsCompleted: shipperOrg.shipper_loads_completed || 0,
+        shipperCancellations: shipperOrg.shipper_cancellations || 0,
+        shipperDisputes: shipperOrg.shipper_disputes || 0,
+        shipperOnTimeRate: shipperOrg.shipper_on_time_rate ? parseFloat(shipperOrg.shipper_on_time_rate) : 100,
+      },
+      connectionStatus: relationshipStatus,
+      relationshipId: relationResult.rows[0]?.id || null,
+    });
+  } catch (error) {
+    console.error('[Broker] Get shipper by org error:', error);
+    res.status(500).json({ error: 'Failed to get shipper' });
+  }
+});
+
+/**
  * GET /broker/discover-shippers
  * Discover shippers on platform
  */
