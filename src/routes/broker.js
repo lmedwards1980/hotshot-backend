@@ -147,9 +147,9 @@ router.get('/carriers/search', authenticate, requireBroker, async (req, res) => 
   try {
     const { mc, name, city, state, q, limit = 20 } = req.query;
 
-    // If 'q' is provided, search across all fields
-    if (q) {
-      const searchTerm = `%${q}%`;
+    // If 'q' is provided (even empty string), do unified search
+    if (q !== undefined) {
+      const searchTerm = q.trim() ? `%${q}%` : '%';
       const result = await pool.query(`
         SELECT 
           o.id, o.name, o.mc_number, o.dot_number, o.city, o.state,
@@ -160,15 +160,15 @@ router.get('/carriers/search', authenticate, requireBroker, async (req, res) => 
           ) as already_in_network
         FROM orgs o
         WHERE o.org_type = 'carrier' AND o.is_active = true
-          AND (
+          ${q.trim() ? `AND (
             o.name ILIKE $2 OR 
             o.city ILIKE $2 OR 
             o.mc_number ILIKE $2 OR
             o.dot_number ILIKE $2
-          )
-        ORDER BY o.loads_completed DESC NULLS LAST
-        LIMIT $3
-      `, [req.brokerOrg.id, searchTerm, limit]);
+          )` : ''}
+        ORDER BY o.loads_completed DESC NULLS LAST, o.name ASC
+        LIMIT $${q.trim() ? '3' : '2'}
+      `, q.trim() ? [req.brokerOrg.id, searchTerm, limit] : [req.brokerOrg.id, limit]);
 
       return res.json({ carriers: result.rows });
     }
