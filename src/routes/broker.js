@@ -145,10 +145,37 @@ router.get('/carriers', authenticate, requireBroker, async (req, res) => {
  */
 router.get('/carriers/search', authenticate, requireBroker, async (req, res) => {
   try {
-    const { mc, name, city, state, limit = 20 } = req.query;
+    const { mc, name, city, state, q, limit = 20 } = req.query;
 
+    // If 'q' is provided, search across all fields
+    if (q) {
+      const searchTerm = `%${q}%`;
+      const result = await pool.query(`
+        SELECT 
+          o.id, o.name, o.mc_number, o.dot_number, o.city, o.state,
+          o.verification_status, o.loads_completed, o.on_time_rate,
+          EXISTS(
+            SELECT 1 FROM broker_carriers bc 
+            WHERE bc.broker_org_id = $1 AND bc.carrier_org_id = o.id
+          ) as already_in_network
+        FROM orgs o
+        WHERE o.org_type = 'carrier' AND o.is_active = true
+          AND (
+            o.name ILIKE $2 OR 
+            o.city ILIKE $2 OR 
+            o.mc_number ILIKE $2 OR
+            o.dot_number ILIKE $2
+          )
+        ORDER BY o.loads_completed DESC NULLS LAST
+        LIMIT $3
+      `, [req.brokerOrg.id, searchTerm, limit]);
+
+      return res.json({ carriers: result.rows });
+    }
+
+    // Legacy field-specific search
     if (!mc && !name && !city) {
-      return res.status(400).json({ error: 'Provide mc, name, or city to search' });
+      return res.status(400).json({ error: 'Provide q, mc, name, or city to search' });
     }
 
     let whereClause = `WHERE o.org_type = 'carrier' AND o.is_active = true`;
