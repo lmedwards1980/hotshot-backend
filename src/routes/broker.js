@@ -845,28 +845,35 @@ router.get('/shippers/org/:orgId', authenticate, requireBroker, async (req, res)
  */
 router.get('/discover-shippers', authenticate, requireBroker, async (req, res) => {
   try {
-    const { search, city, state, industry, limit = 20, offset = 0 } = req.query;
+    const { search, city, state, limit = 20, offset = 0 } = req.query;
+    const brokerOrgId = req.brokerOrg.id;
 
-    let whereClause = `WHERE o.org_type = 'shipper' AND o.is_active = true`;
-    const params = [];
-    let paramIndex = 1;
+    // Build dynamic WHERE clause
+    let whereConditions = [`o.org_type = 'shipper'`, `o.is_active = true`];
+    const params = [brokerOrgId]; // $1 is always brokerOrgId
+    let paramIndex = 2;
 
     if (search) {
-      whereClause += ` AND o.name ILIKE $${paramIndex++}`;
+      whereConditions.push(`o.name ILIKE $${paramIndex++}`);
       params.push(`%${search}%`);
     }
 
     if (city) {
-      whereClause += ` AND o.city ILIKE $${paramIndex++}`;
+      whereConditions.push(`o.city ILIKE $${paramIndex++}`);
       params.push(`%${city}%`);
     }
 
     if (state) {
-      whereClause += ` AND o.state = $${paramIndex++}`;
+      whereConditions.push(`o.state = $${paramIndex++}`);
       params.push(state.toUpperCase());
     }
 
-    params.push(req.brokerOrg.id, limit, offset);
+    // Add limit and offset
+    const limitParamIndex = paramIndex++;
+    const offsetParamIndex = paramIndex++;
+    params.push(parseInt(limit), parseInt(offset));
+
+    const whereClause = whereConditions.join(' AND ');
 
     const result = await pool.query(`
       SELECT 
@@ -876,29 +883,19 @@ router.get('/discover-shippers', authenticate, requireBroker, async (req, res) =
         bs.id as relationship_id,
         bs.status as relationship_status,
         cr.id as pending_request_id,
-        cr.status as request_status,
-        cr.attempt_number,
-        (
-          SELECT MAX(sent_at) FROM broker_connection_requests 
-          WHERE broker_org_id = $${paramIndex} AND shipper_org_id = o.id
-        ) as last_request_at,
-        (
-          SELECT was_declined FROM broker_connection_attempts
-          WHERE broker_org_id = $${paramIndex} AND shipper_org_id = o.id
-          ORDER BY attempt_at DESC LIMIT 1
-        ) as was_ever_declined
+        cr.status as request_status
       FROM orgs o
       LEFT JOIN users u ON u.id = (
         SELECT user_id FROM memberships 
         WHERE org_id = o.id AND is_primary = true 
         LIMIT 1
       )
-      LEFT JOIN broker_shippers bs ON bs.shipper_org_id = o.id AND bs.broker_org_id = $${paramIndex}
+      LEFT JOIN broker_shippers bs ON bs.shipper_org_id = o.id AND bs.broker_org_id = $1
       LEFT JOIN broker_connection_requests cr ON cr.shipper_org_id = o.id 
-        AND cr.broker_org_id = $${paramIndex} AND cr.status = 'pending'
-      ${whereClause}
-      ORDER BY u.shipper_score DESC NULLS LAST, u.shipper_loads_completed DESC NULLS LAST
-      LIMIT $${paramIndex + 1} OFFSET $${paramIndex + 2}
+        AND cr.broker_org_id = $1 AND cr.status = 'pending'
+      WHERE ${whereClause}
+      ORDER BY u.shipper_score DESC NULLS LAST, o.name ASC
+      LIMIT $${limitParamIndex} OFFSET $${offsetParamIndex}
     `, params);
 
     res.json({
@@ -916,8 +913,9 @@ router.get('/discover-shippers', authenticate, requireBroker, async (req, res) =
         relationshipStatus: row.relationship_status,
         pendingRequestId: row.pending_request_id,
         requestStatus: row.request_status,
-        attemptNumber: row.attempt_number,
-        wasEverDeclined: row.was_ever_declined,
+        // Derive status for UI
+        status: row.relationship_status === 'active' ? 'connected' :
+                row.request_status === 'pending' ? 'pending' : null
       })),
       pagination: { limit: parseInt(limit), offset: parseInt(offset) }
     });
