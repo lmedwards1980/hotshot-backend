@@ -66,8 +66,8 @@ router.post('/', authenticate, async (req, res) => {
       return res.status(403).json({ error: 'Only carriers can submit offers' });
     }
 
-    // Check if user has permission (carrier_admin or dispatcher)
-    if (!['carrier_admin', 'dispatcher'].includes(userOrg.role)) {
+    // Check if user has permission (carrier_admin, dispatcher, or driver in carrier org)
+    if (!['carrier_admin', 'dispatcher', 'driver'].includes(userOrg.role)) {
       return res.status(403).json({ error: 'You do not have permission to submit offers' });
     }
 
