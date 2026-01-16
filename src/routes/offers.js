@@ -55,19 +55,24 @@ router.post('/', authenticate, async (req, res) => {
       return res.status(400).json({ error: 'loadId and amount are required' });
     }
 
-    // Get user's org - must be a carrier
+    // Get user's org - must be a carrier or broker
     const userOrg = await getUserPrimaryOrg(req.user.id);
     
     if (!userOrg) {
       return res.status(403).json({ error: 'You must belong to an organization to submit offers' });
     }
 
-    if (userOrg.org_type !== 'carrier') {
-      return res.status(403).json({ error: 'Only carriers can submit offers' });
+    // Allow carriers and brokers to submit offers
+    if (!['carrier', 'broker'].includes(userOrg.org_type)) {
+      return res.status(403).json({ error: 'Only carriers and brokers can submit offers' });
     }
 
-    // Check if user has permission (carrier_admin, dispatcher, or driver in carrier org)
-    if (!['carrier_admin', 'dispatcher', 'driver'].includes(userOrg.role)) {
+    // Check if user has permission based on org type
+    const allowedRoles = userOrg.org_type === 'carrier' 
+      ? ['carrier_admin', 'dispatcher', 'driver']
+      : ['broker_admin', 'broker_agent'];
+    
+    if (!allowedRoles.includes(userOrg.role)) {
       return res.status(403).json({ error: 'You do not have permission to submit offers' });
     }
 
@@ -656,8 +661,8 @@ router.put('/:id/accept-counter', authenticate, async (req, res) => {
   try {
     const userOrg = await getUserPrimaryOrg(req.user.id);
 
-    if (!userOrg || userOrg.org_type !== 'carrier') {
-      return res.status(403).json({ error: 'Only carriers can accept counter offers' });
+    if (!userOrg || !['carrier', 'broker'].includes(userOrg.org_type)) {
+      return res.status(403).json({ error: 'Only carriers and brokers can accept counter offers' });
     }
 
     // Get offer
@@ -755,14 +760,14 @@ router.put('/:id/accept-counter', authenticate, async (req, res) => {
 
 /**
  * PUT /offers/:id/withdraw
- * Withdraw an offer (carrier only)
+ * Withdraw an offer (carrier or broker)
  */
 router.put('/:id/withdraw', authenticate, async (req, res) => {
   try {
     const userOrg = await getUserPrimaryOrg(req.user.id);
 
-    if (!userOrg || userOrg.org_type !== 'carrier') {
-      return res.status(403).json({ error: 'Only carriers can withdraw offers' });
+    if (!userOrg || !['carrier', 'broker'].includes(userOrg.org_type)) {
+      return res.status(403).json({ error: 'Only carriers and brokers can withdraw offers' });
     }
 
     // Get and verify offer
