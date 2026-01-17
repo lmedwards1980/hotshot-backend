@@ -4,7 +4,13 @@ const express = require('express');
 const crypto = require('crypto');
 const { pool } = require('../db/pool');
 const { authenticate } = require('../middleware/auth');
-const notificationService = require('../services/notificationService');
+let notificationService;
+try {
+  notificationService = require('../services/notificationService');
+} catch (e) {
+  console.warn('[Closeouts] Notification service not available');
+  notificationService = { sendPushNotification: async () => {} };
+}
 
 const router = express.Router();
 
