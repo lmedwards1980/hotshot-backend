@@ -22,6 +22,7 @@ const matchingRoutes = require('./routes/matching');
 const notificationsRoutes = require('./routes/notifications');
 const dispatchRoutes = require('./routes/dispatch');
 const brokerRoutes = require('./routes/broker');
+const closeoutRoutes = require('./routes/closeouts');
 
 // CREATE APP FIRST - before any app.use() calls
 const app = express();
@@ -88,6 +89,7 @@ app.use('/api/rates', ratesRoutes);
 app.use('/api/matching', matchingRoutes);
 app.use('/api/notifications', notificationsRoutes);
 app.use('/api/broker', brokerRoutes);
+app.use('/api/closeouts', closeoutRoutes);
 
 // ---------------------------------------------------------
 // Error Handling

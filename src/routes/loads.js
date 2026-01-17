@@ -1,4 +1,5 @@
 // Load Routes - Updated with Org Context for 5-Role Model
+// + Visibility & Tendering for Brokers
 const express = require('express');
 const { pool } = require('../db/pool');
 const { authenticate, requireUserType } = require('../middleware/auth');
@@ -26,6 +27,39 @@ const getUserPrimaryOrg = async (userId) => {
   `, [userId]);
   
   return result.rows[0] || null;
+};
+
+/**
+ * Helper: Check if carrier is in broker's network
+ */
+const isCarrierInBrokerNetwork = async (brokerOrgId, carrierOrgId) => {
+  if (!brokerOrgId || !carrierOrgId) return false;
+  
+  const result = await pool.query(`
+    SELECT id FROM broker_carriers 
+    WHERE broker_org_id = $1 
+      AND carrier_org_id = $2 
+      AND status = 'active'
+      AND blocked_at IS NULL
+  `, [brokerOrgId, carrierOrgId]);
+  
+  return result.rows.length > 0;
+};
+
+/**
+ * Helper: Get all carrier org IDs in a broker's network
+ */
+const getBrokerCarrierOrgIds = async (brokerOrgId) => {
+  if (!brokerOrgId) return [];
+  
+  const result = await pool.query(`
+    SELECT carrier_org_id FROM broker_carriers 
+    WHERE broker_org_id = $1 
+      AND status = 'active'
+      AND blocked_at IS NULL
+  `, [brokerOrgId]);
+  
+  return result.rows.map(r => r.carrier_org_id);
 };
 
 /**
@@ -158,7 +192,7 @@ router.post('/seed', async (req, res) => {
 /**
  * POST /loads
  * Create a new load (shipper/broker only)
- * Updated with org context and broker fields
+ * Updated with org context, broker fields, and VISIBILITY & TENDERING
  */
 router.post('/',
   authenticate,
@@ -186,18 +220,21 @@ router.post('/',
         // Pricing & type
         price, loadType, expeditedFee,
         distanceMiles,
-        // NEW: Broker fields
+        // Broker fields
         customerName,        // Broker's customer name
         customerLoadNumber,  // Customer's load reference
         customerPo,          // Customer PO number
         customerRate,        // What broker charges customer
         carrierPay,          // What broker pays carrier (their margin)
-        // NEW: Booking options
+        // Booking options
         allowOffers,         // Allow carriers to submit offers
         allowBookNow,        // Allow instant booking at posted rate
         minOffer,            // Minimum acceptable offer
         verifiedOnly,        // Only verified carriers can book
         trackingRequired,    // Require tracking
+        // NEW: Visibility & Tendering
+        visibility,          // 'public', 'preferred_first', 'private'
+        preferredWindowMinutes,  // 15, 30, 60, 120, or null (manual release)
       } = req.body;
 
       // Get user's org context
@@ -226,6 +263,20 @@ router.post('/',
       const driverPayout = finalCarrierPay * 0.85; // Driver gets 85% of carrier pay
       const platformFee = totalPrice * 0.15;
 
+      // Handle visibility & tendering (broker feature)
+      // For non-brokers, default to 'public'
+      const finalVisibility = isBroker ? (visibility || 'public') : 'public';
+      const finalWindowMinutes = (isBroker && finalVisibility !== 'public') 
+        ? (preferredWindowMinutes || null) 
+        : null;
+      
+      // Calculate release_to_public_at if preferred_first with a window
+      let releaseToPublicAt = null;
+      if (finalVisibility === 'preferred_first' && finalWindowMinutes) {
+        // Will be set via SQL: CURRENT_TIMESTAMP + interval
+        releaseToPublicAt = `INTERVAL '${finalWindowMinutes} minutes'`;
+      }
+
       const result = await pool.query(
         `INSERT INTO loads (
           shipper_id, posted_by_user_id, posted_by_org_id,
@@ -249,9 +300,11 @@ router.post('/',
           carrier_pay,
           allow_offers, allow_book_now, min_offer,
           verified_only, tracking_required,
+          visibility, preferred_window_minutes, release_to_public_at,
           status, posted_at
         ) VALUES (
           $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54,
+          $55, $56, ${finalWindowMinutes ? `CURRENT_TIMESTAMP + INTERVAL '${finalWindowMinutes} minutes'` : 'NULL'},
           'posted', CURRENT_TIMESTAMP
         ) RETURNING *`,
         [
@@ -282,10 +335,19 @@ router.post('/',
           minOffer || null,
           verifiedOnly || false,
           trackingRequired !== false, // default true
+          finalVisibility,
+          finalWindowMinutes,
         ]
       );
 
       const load = result.rows[0];
+
+      // Notify preferred carriers if visibility is not public
+      if (isBroker && finalVisibility !== 'public' && userOrg?.org_id) {
+        notifyPreferredCarriers(userOrg.org_id, load).catch(err => 
+          console.error('[Loads] Failed to notify preferred carriers:', err)
+        );
+      }
 
       res.status(201).json({
         message: 'Load posted successfully',
@@ -297,6 +359,46 @@ router.post('/',
     }
   }
 );
+
+/**
+ * Helper: Notify preferred carriers about new load
+ */
+async function notifyPreferredCarriers(brokerOrgId, load) {
+  try {
+    // Get all active carriers in broker's network
+    const carriers = await pool.query(`
+      SELECT bc.carrier_org_id, o.name as carrier_name
+      FROM broker_carriers bc
+      JOIN orgs o ON bc.carrier_org_id = o.id
+      WHERE bc.broker_org_id = $1 
+        AND bc.status = 'active'
+        AND bc.blocked_at IS NULL
+    `, [brokerOrgId]);
+
+    // Get all users in those carrier orgs who should be notified
+    for (const carrier of carriers.rows) {
+      const users = await pool.query(`
+        SELECT u.id, u.first_name
+        FROM users u
+        JOIN memberships m ON u.id = m.user_id
+        WHERE m.org_id = $1 
+          AND m.is_active = true
+          AND m.role IN ('carrier_admin', 'dispatcher')
+      `, [carrier.carrier_org_id]);
+
+      for (const user of users.rows) {
+        await notificationService.sendPushNotification(
+          user.id,
+          'New Load from Preferred Broker',
+          `${load.pickup_city}, ${load.pickup_state} → ${load.delivery_city}, ${load.delivery_state} • $${load.carrier_pay || load.price}`,
+          { loadId: load.id, type: 'preferred_load' }
+        ).catch(err => console.error('[Notify] Push failed:', err));
+      }
+    }
+  } catch (error) {
+    console.error('[Loads] Notify preferred carriers error:', error);
+  }
+}
 
 /**
  * GET /loads
@@ -409,28 +511,116 @@ router.get('/', authenticate, async (req, res) => {
 /**
  * GET /loads/available
  * Get available loads for carriers/dispatchers/drivers
+ * NOW WITH VISIBILITY FILTERING
  */
 router.get('/available', authenticate, async (req, res) => {
   try {
     const { limit = 20, offset = 0 } = req.query;
 
-    // Get user's org to check verification status for priority matching
+    // Get user's org to check if they're in any broker's network
     const userOrg = await getUserPrimaryOrg(req.user.id);
+    const carrierOrgId = userOrg?.org_type === 'carrier' ? userOrg.org_id : null;
 
-    const result = await pool.query(
-      `SELECT l.*, 
+    // Build visibility filter
+    // A carrier can see a load if:
+    // 1. visibility = 'public', OR
+    // 2. visibility = 'preferred_first' AND (release_to_public_at has passed OR carrier is in broker's network), OR
+    // 3. visibility = 'private' AND carrier is in broker's network
+    
+    let visibilityFilter;
+    if (carrierOrgId) {
+      visibilityFilter = `
+        AND (
+          l.visibility = 'public'
+          OR l.visibility IS NULL
+          OR (l.visibility = 'preferred_first' AND (
+            l.release_to_public_at IS NULL 
+            OR l.release_to_public_at <= CURRENT_TIMESTAMP
+            OR l.released_early_at IS NOT NULL
+            OR EXISTS (
+              SELECT 1 FROM broker_carriers bc 
+              WHERE bc.broker_org_id = l.posted_by_org_id 
+                AND bc.carrier_org_id = $3
+                AND bc.status = 'active'
+                AND bc.blocked_at IS NULL
+            )
+          ))
+          OR (l.visibility = 'private' AND EXISTS (
+            SELECT 1 FROM broker_carriers bc 
+            WHERE bc.broker_org_id = l.posted_by_org_id 
+              AND bc.carrier_org_id = $3
+              AND bc.status = 'active'
+              AND bc.blocked_at IS NULL
+          ))
+        )
+      `;
+    } else {
+      // No carrier org - can only see public loads or released loads
+      visibilityFilter = `
+        AND (
+          l.visibility = 'public'
+          OR l.visibility IS NULL
+          OR (l.visibility = 'preferred_first' AND (
+            l.release_to_public_at IS NULL 
+            OR l.release_to_public_at <= CURRENT_TIMESTAMP
+            OR l.released_early_at IS NOT NULL
+          ))
+        )
+      `;
+    }
+
+    const query = `
+      SELECT l.*, 
         CONCAT(u.first_name, ' ', u.last_name) as shipper_name,
         o.name as shipper_org_name,
         o.org_type as shipper_org_type,
-        o.verification_status as shipper_verification
+        o.verification_status as shipper_verification,
+        shipper_user.shipper_score,
+        shipper_user.shipper_loads_completed,
+        shipper_user.shipper_on_time_rate,
+        shipper_user.shipper_disputes,
+        ${carrierOrgId ? `
+        CASE WHEN EXISTS (
+          SELECT 1 FROM broker_carriers bc 
+          WHERE bc.broker_org_id = l.posted_by_org_id 
+            AND bc.carrier_org_id = $3
+            AND bc.status = 'active'
+        ) THEN true ELSE false END as is_preferred_broker
+        ` : 'false as is_preferred_broker'}
        FROM loads l
        JOIN users u ON l.shipper_id = u.id
+       JOIN users shipper_user ON l.shipper_id = shipper_user.id
        LEFT JOIN orgs o ON l.posted_by_org_id = o.id
        WHERE l.status = 'posted'
-       ORDER BY l.posted_at DESC
-       LIMIT $1 OFFSET $2`,
-      [limit, offset]
-    );
+       ${visibilityFilter}
+       ORDER BY 
+         ${carrierOrgId ? 'is_preferred_broker DESC,' : ''} 
+         l.posted_at DESC
+       LIMIT $1 OFFSET $2`;
+    
+    const params = carrierOrgId 
+      ? [limit, offset, carrierOrgId]
+      : [limit, offset];
+
+    const result = await pool.query(query, params);
+
+    // Track views by preferred carriers
+    if (carrierOrgId && result.rows.length > 0) {
+      const preferredLoadIds = result.rows
+        .filter(l => l.is_preferred_broker && l.visibility !== 'public')
+        .map(l => l.id);
+      
+      if (preferredLoadIds.length > 0) {
+        // Increment views_by_preferred for these loads
+        pool.query(`
+          UPDATE loads 
+          SET views_by_preferred = COALESCE(views_by_preferred, 0) + 1
+          WHERE id = ANY($1)
+        `, [preferredLoadIds]).catch(err => 
+          console.error('[Loads] Failed to track preferred views:', err)
+        );
+      }
+    }
 
     res.json({
       loads: result.rows.map(load => ({
@@ -438,6 +628,12 @@ router.get('/available', authenticate, async (req, res) => {
         shipperOrgName: load.shipper_org_name,
         shipperOrgType: load.shipper_org_type,
         shipperVerified: load.shipper_verification === 'verified',
+        isPreferredBroker: load.is_preferred_broker || false,
+        // Shipper integrity scores
+        shipperScore: load.shipper_score ? parseFloat(load.shipper_score) : null,
+        shipperLoadsCompleted: load.shipper_loads_completed || 0,
+        shipperOnTimeRate: load.shipper_on_time_rate ? parseFloat(load.shipper_on_time_rate) : null,
+        shipperDisputes: load.shipper_disputes || 0,
       })),
       count: result.rows.length,
       userOrg: userOrg ? {
@@ -452,6 +648,124 @@ router.get('/available', authenticate, async (req, res) => {
     res.status(500).json({ error: 'Failed to get available loads' });
   }
 });
+
+/**
+ * PUT /loads/:id/release
+ * Broker manually releases a preferred/private load to public
+ */
+router.put('/:id/release',
+  authenticate,
+  async (req, res) => {
+    try {
+      const loadId = req.params.id;
+      const userOrg = await getUserPrimaryOrg(req.user.id);
+
+      // Verify ownership
+      const loadCheck = await pool.query(`
+        SELECT * FROM loads 
+        WHERE id = $1 
+          AND (posted_by_user_id = $2 OR posted_by_org_id = $3)
+          AND status = 'posted'
+      `, [loadId, req.user.id, userOrg?.org_id]);
+
+      if (loadCheck.rows.length === 0) {
+        return res.status(404).json({ error: 'Load not found or not eligible for release' });
+      }
+
+      const load = loadCheck.rows[0];
+
+      if (load.visibility === 'public') {
+        return res.status(400).json({ error: 'Load is already public' });
+      }
+
+      // Release to public
+      const result = await pool.query(`
+        UPDATE loads 
+        SET released_early_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $1
+        RETURNING *
+      `, [loadId]);
+
+      res.json({
+        message: 'Load released to public',
+        load: formatLoadResponse(result.rows[0]),
+      });
+    } catch (error) {
+      console.error('[Loads] Release error:', error);
+      res.status(500).json({ error: 'Failed to release load' });
+    }
+  }
+);
+
+/**
+ * GET /loads/:id/tendering-status
+ * Get tendering status for a load (broker view)
+ */
+router.get('/:id/tendering-status',
+  authenticate,
+  async (req, res) => {
+    try {
+      const loadId = req.params.id;
+      const userOrg = await getUserPrimaryOrg(req.user.id);
+
+      const result = await pool.query(`
+        SELECT 
+          l.id,
+          l.visibility,
+          l.preferred_window_minutes,
+          l.release_to_public_at,
+          l.released_early_at,
+          l.views_by_preferred,
+          l.posted_at,
+          l.status,
+          (SELECT COUNT(*) FROM offers WHERE load_id = l.id) as offer_count,
+          (SELECT COUNT(*) FROM offers WHERE load_id = l.id AND status = 'pending') as pending_offer_count
+        FROM loads l
+        WHERE l.id = $1 
+          AND (l.posted_by_user_id = $2 OR l.posted_by_org_id = $3)
+      `, [loadId, req.user.id, userOrg?.org_id]);
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: 'Load not found' });
+      }
+
+      const load = result.rows[0];
+      const now = new Date();
+      const releaseAt = load.release_to_public_at ? new Date(load.release_to_public_at) : null;
+      
+      let timeRemainingSeconds = null;
+      let isReleased = false;
+
+      if (load.visibility === 'public' || load.released_early_at) {
+        isReleased = true;
+      } else if (load.visibility === 'preferred_first' && releaseAt) {
+        if (releaseAt <= now) {
+          isReleased = true;
+        } else {
+          timeRemainingSeconds = Math.floor((releaseAt - now) / 1000);
+        }
+      }
+
+      res.json({
+        loadId: load.id,
+        visibility: load.visibility,
+        preferredWindowMinutes: load.preferred_window_minutes,
+        releaseToPublicAt: load.release_to_public_at,
+        releasedEarlyAt: load.released_early_at,
+        isReleased,
+        timeRemainingSeconds,
+        viewsByPreferred: load.views_by_preferred || 0,
+        offerCount: parseInt(load.offer_count) || 0,
+        pendingOfferCount: parseInt(load.pending_offer_count) || 0,
+        status: load.status,
+      });
+    } catch (error) {
+      console.error('[Loads] Tendering status error:', error);
+      res.status(500).json({ error: 'Failed to get tendering status' });
+    }
+  }
+);
 
 /**
  * GET /loads/active
@@ -567,16 +881,12 @@ router.get('/company', authenticate, async (req, res) => {
         ? [companyId, status, limit, offset]
         : [companyId, limit, offset];
     } else {
-      // Solo user - just get their own loads
+      // Solo shipper - just their loads
       query = `
         SELECT l.*, 
-          CONCAT(shipper.first_name, ' ', shipper.last_name) as shipper_name,
-          shipper.email as shipper_email,
-          shipper.department as shipper_department,
           CONCAT(driver.first_name, ' ', driver.last_name) as driver_name,
           driver.phone as driver_phone
         FROM loads l
-        JOIN users shipper ON l.shipper_id = shipper.id
         LEFT JOIN users driver ON l.driver_id = driver.id
         WHERE l.shipper_id = $1
         ${status ? 'AND l.status = $2' : ''}
@@ -589,45 +899,26 @@ router.get('/company', authenticate, async (req, res) => {
 
     const result = await pool.query(query, params);
 
-    // Get stats
-    let statsQuery;
-    let statsParams;
-
+    // Count total
+    let countQuery;
+    let countParams;
+    
     if (userOrg?.org_id) {
-      statsQuery = `
-        SELECT 
-          COUNT(*) as total,
-          COUNT(*) FILTER (WHERE l.status NOT IN ('delivered', 'cancelled', 'completed')) as active,
-          COUNT(*) FILTER (WHERE l.status IN ('delivered', 'completed')) as completed,
-          COALESCE(SUM(l.price) FILTER (WHERE l.status IN ('delivered', 'completed')), 0) as total_spent
-        FROM loads l
-        WHERE l.posted_by_org_id = $1`;
-      statsParams = [userOrg.org_id];
+      countQuery = `SELECT COUNT(*) FROM loads WHERE posted_by_org_id = $1 ${status ? 'AND status = $2' : ''}`;
+      countParams = status ? [userOrg.org_id, status] : [userOrg.org_id];
     } else if (companyId) {
-      statsQuery = `
-        SELECT 
-          COUNT(*) as total,
-          COUNT(*) FILTER (WHERE l.status NOT IN ('delivered', 'cancelled', 'completed')) as active,
-          COUNT(*) FILTER (WHERE l.status IN ('delivered', 'completed')) as completed,
-          COALESCE(SUM(l.price) FILTER (WHERE l.status IN ('delivered', 'completed')), 0) as total_spent
-        FROM loads l
-        JOIN users shipper ON l.shipper_id = shipper.id
-        WHERE shipper.company_id = $1`;
-      statsParams = [companyId];
+      countQuery = `
+        SELECT COUNT(*) FROM loads l 
+        JOIN users shipper ON l.shipper_id = shipper.id 
+        WHERE shipper.company_id = $1 ${status ? 'AND l.status = $2' : ''}`;
+      countParams = status ? [companyId, status] : [companyId];
     } else {
-      statsQuery = `
-        SELECT 
-          COUNT(*) as total,
-          COUNT(*) FILTER (WHERE status NOT IN ('delivered', 'cancelled', 'completed')) as active,
-          COUNT(*) FILTER (WHERE status IN ('delivered', 'completed')) as completed,
-          COALESCE(SUM(price) FILTER (WHERE status IN ('delivered', 'completed')), 0) as total_spent
-        FROM loads
-        WHERE shipper_id = $1`;
-      statsParams = [req.user.id];
+      countQuery = `SELECT COUNT(*) FROM loads WHERE shipper_id = $1 ${status ? 'AND status = $2' : ''}`;
+      countParams = status ? [req.user.id, status] : [req.user.id];
     }
 
-    const statsResult = await pool.query(statsQuery, statsParams);
-    const stats = statsResult.rows[0];
+    const countResult = await pool.query(countQuery, countParams);
+    const total = parseInt(countResult.rows[0].count);
 
     res.json({
       loads: result.rows.map(load => ({
@@ -638,12 +929,7 @@ router.get('/company', authenticate, async (req, res) => {
         postedByName: load.posted_by_name,
       })),
       count: result.rows.length,
-      stats: {
-        total: parseInt(stats.total) || 0,
-        active: parseInt(stats.active) || 0,
-        completed: parseInt(stats.completed) || 0,
-        totalSpent: parseFloat(stats.total_spent) || 0,
-      },
+      total,
       org: userOrg ? {
         id: userOrg.org_id,
         name: userOrg.org_name,
@@ -658,34 +944,45 @@ router.get('/company', authenticate, async (req, res) => {
 
 /**
  * GET /loads/:id
- * Get single load details WITH driver location for tracking
- * FIXED: Now returns driver GPS coordinates for shipper tracking
+ * Get single load details with driver location for tracking
  */
 router.get('/:id', authenticate, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT l.*,
-        CONCAT(shipper.first_name, ' ', shipper.last_name) as shipper_name, 
+    const loadId = req.params.id;
+    const userOrg = await getUserPrimaryOrg(req.user.id);
+
+    const result = await pool.query(`
+      SELECT 
+        l.*,
+        shipper.first_name as shipper_first_name,
+        shipper.last_name as shipper_last_name,
         shipper.phone as shipper_phone,
-        shipper.id as shipper_user_id,
-        CONCAT(driver.first_name, ' ', driver.last_name) as driver_name, 
+        shipper.email as shipper_email,
+        shipper.company_name as shipper_company,
+        shipper_org.name as shipper_org_name,
+        shipper_org.org_type as shipper_org_type,
+        driver.first_name as driver_first_name,
+        driver.last_name as driver_last_name,
         driver.phone as driver_phone,
-        driver.id as driver_user_id,
         driver.vehicle_type as driver_vehicle_type,
         driver.license_plate as driver_license_plate,
         driver.driver_lat as driver_current_lat,
         driver.driver_lng as driver_current_lng,
-        driver.location_updated_at as driver_location_updated_at,
-        poster_org.name as poster_org_name,
-        poster_org.org_type as poster_org_type,
-        poster_org.verification_status as poster_verification
-       FROM loads l
-       JOIN users shipper ON l.shipper_id = shipper.id
-       LEFT JOIN users driver ON l.driver_id = driver.id
-       LEFT JOIN orgs poster_org ON l.posted_by_org_id = poster_org.id
-       WHERE l.id = $1`,
-      [req.params.id]
-    );
+        driver.location_updated_at as driver_last_location_update,
+        driver.rating as driver_rating,
+        driver.rating_count as driver_rating_count,
+        carrier_org.name as carrier_org_name,
+        carrier_org.mc_number as carrier_mc,
+        (SELECT COUNT(*) FROM offers WHERE load_id = l.id) as offer_count,
+        (SELECT COUNT(*) FROM offers WHERE load_id = l.id AND status = 'pending') as pending_offer_count
+      FROM loads l
+      LEFT JOIN users shipper ON l.shipper_id = shipper.id
+      LEFT JOIN orgs shipper_org ON l.posted_by_org_id = shipper_org.id
+      LEFT JOIN users driver ON l.driver_id = driver.id
+      LEFT JOIN memberships driver_membership ON driver.id = driver_membership.user_id AND driver_membership.is_primary = true
+      LEFT JOIN orgs carrier_org ON driver_membership.org_id = carrier_org.id
+      WHERE l.id = $1
+    `, [loadId]);
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Load not found' });
@@ -693,187 +990,66 @@ router.get('/:id', authenticate, async (req, res) => {
 
     const load = result.rows[0];
 
-    // Check authorization - also check org membership
-    const userOrg = await getUserPrimaryOrg(req.user.id);
-    const isShipper = load.shipper_id === req.user.id;
-    const isDriver = load.driver_id === req.user.id;
-    const isOrgMember = userOrg?.org_id && load.posted_by_org_id === userOrg.org_id;
-    const isAvailable = load.status === 'posted';
+    // Check access permissions
+    const isShipperOwner = load.shipper_id === req.user.id || load.posted_by_org_id === userOrg?.org_id;
+    const isDriverOwner = load.driver_id === req.user.id;
+    const isCarrierMember = userOrg?.org_type === 'carrier' && load.assigned_carrier_org_id === userOrg.org_id;
 
-    if (!isShipper && !isDriver && !isOrgMember && !isAvailable) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-
-    // Build response with driver object containing location
+    // Format response based on role
     const response = {
-      ...formatLoadResponse(load, true),
-      shipper: {
-        id: load.shipper_user_id,
-        name: load.shipper_name,
-        phone: load.shipper_phone,
+      load: {
+        ...formatLoadResponse(load, true),
+        offerCount: parseInt(load.offer_count) || 0,
+        pendingOfferCount: parseInt(load.pending_offer_count) || 0,
+        shipper: {
+          id: load.shipper_id,
+          name: `${load.shipper_first_name || ''} ${load.shipper_last_name || ''}`.trim(),
+          phone: load.shipper_phone,
+          email: isShipperOwner ? load.shipper_email : undefined,
+          companyName: load.shipper_company || load.shipper_org_name,
+          orgName: load.shipper_org_name,
+          orgType: load.shipper_org_type,
+        },
       },
-      posterOrg: load.posted_by_org_id ? {
-        id: load.posted_by_org_id,
-        name: load.poster_org_name,
-        type: load.poster_org_type,
-        verified: load.poster_verification === 'verified',
-      } : null,
     };
 
-    // Include driver info with current location if driver is assigned
+    // Include driver info if assigned
     if (load.driver_id) {
-      response.driver = {
-        id: load.driver_user_id,
-        firstName: load.driver_name ? load.driver_name.split(' ')[0] : null,
-        lastName: load.driver_name ? load.driver_name.split(' ').slice(1).join(' ') : null,
-        name: load.driver_name,
+      response.load.driver = {
+        id: load.driver_id,
+        name: `${load.driver_first_name || ''} ${load.driver_last_name || ''}`.trim(),
         phone: load.driver_phone,
         vehicleType: load.driver_vehicle_type,
         licensePlate: load.driver_license_plate,
-        currentLat: load.driver_current_lat ? parseFloat(load.driver_current_lat) : null,
-        currentLng: load.driver_current_lng ? parseFloat(load.driver_current_lng) : null,
-        lastLocationUpdate: load.driver_location_updated_at,
+        rating: load.driver_rating ? parseFloat(load.driver_rating) : null,
+        ratingCount: load.driver_rating_count || 0,
+        carrierName: load.carrier_org_name,
+        carrierMc: load.carrier_mc,
       };
+
+      // Include live location for tracking (shipper/broker viewing their load)
+      if (isShipperOwner && load.driver_current_lat && load.driver_current_lng) {
+        response.load.driver.currentLat = parseFloat(load.driver_current_lat);
+        response.load.driver.currentLng = parseFloat(load.driver_current_lng);
+        response.load.driver.lastLocationUpdate = load.driver_last_location_update;
+      }
+    }
+
+    // Include visibility info for owner
+    if (isShipperOwner) {
+      response.load.visibility = load.visibility;
+      response.load.preferredWindowMinutes = load.preferred_window_minutes;
+      response.load.releaseToPublicAt = load.release_to_public_at;
+      response.load.releasedEarlyAt = load.released_early_at;
+      response.load.viewsByPreferred = load.views_by_preferred;
     }
 
     res.json(response);
   } catch (error) {
-    console.error('[Loads] Get error:', error);
+    console.error('[Loads] Get single error:', error);
     res.status(500).json({ error: 'Failed to get load' });
   }
 });
-
-/**
- * POST /loads/:id/cancel
- * Cancel a load (shipper only, before pickup)
- */
-router.post('/:id/cancel',
-  authenticate,
-  async (req, res) => {
-    try {
-      const { reason } = req.body;
-
-      // Get load and verify ownership (including org membership)
-      const checkResult = await pool.query(
-        'SELECT * FROM loads WHERE id = $1',
-        [req.params.id]
-      );
-
-      if (checkResult.rows.length === 0) {
-        return res.status(404).json({ error: 'Load not found' });
-      }
-
-      const load = checkResult.rows[0];
-
-      // Check authorization - owner or org member with permission
-      const userOrg = await getUserPrimaryOrg(req.user.id);
-      const isOwner = load.shipper_id === req.user.id;
-      const isOrgAdmin = userOrg?.org_id === load.posted_by_org_id && 
-                         ['shipper_admin', 'broker_admin'].includes(userOrg.role);
-
-      if (!isOwner && !isOrgAdmin) {
-        return res.status(403).json({ error: 'Only the shipper or org admin can cancel this load' });
-      }
-
-      // Can only cancel if not yet picked up
-      const cancelableStatuses = ['posted', 'assigned', 'accepted', 'en_route_pickup'];
-      if (!cancelableStatuses.includes(load.status)) {
-        return res.status(400).json({ 
-          error: 'Cannot cancel load after pickup',
-          currentStatus: load.status
-        });
-      }
-
-      // Cancel the load
-      const result = await pool.query(
-        `UPDATE loads 
-         SET status = 'cancelled', 
-             cancelled_at = CURRENT_TIMESTAMP,
-             cancelled_by = $1,
-             updated_at = CURRENT_TIMESTAMP
-         WHERE id = $2
-         RETURNING *`,
-        [req.user.id, req.params.id]
-      );
-
-      // TODO: If driver was assigned, notify them
-      // TODO: Handle any payment refunds
-
-      res.json({
-        message: 'Load cancelled successfully',
-        load: formatLoadResponse(result.rows[0]),
-      });
-    } catch (error) {
-      console.error('[Loads] Cancel error:', error);
-      res.status(500).json({ error: 'Failed to cancel load' });
-    }
-  }
-);
-
-/**
- * POST /loads/:id/accept
- * Accept a load (driver only)
- */
-router.post('/:id/accept',
-  authenticate,
-  requireUserType('driver'),
-  async (req, res) => {
-    try {
-      // Check if load is available
-      const checkResult = await pool.query(
-        'SELECT * FROM loads WHERE id = $1 AND status = \'posted\'',
-        [req.params.id]
-      );
-
-      if (checkResult.rows.length === 0) {
-        return res.status(400).json({ error: 'Load not available' });
-      }
-
-      const load = checkResult.rows[0];
-
-      // Check if load requires verified carrier
-      if (load.verified_only) {
-        const userOrg = await getUserPrimaryOrg(req.user.id);
-        if (!userOrg || userOrg.verification_status !== 'verified') {
-          return res.status(403).json({ 
-            error: 'This load requires a verified carrier',
-            code: 'VERIFICATION_REQUIRED'
-          });
-        }
-      }
-
-      // Assign load to driver
-      const result = await pool.query(
-        `UPDATE loads 
-         SET driver_id = $1, 
-             status = 'assigned', 
-             assigned_at = CURRENT_TIMESTAMP,
-             updated_at = CURRENT_TIMESTAMP
-         WHERE id = $2
-         RETURNING *`,
-        [req.user.id, req.params.id]
-      );
-
-      // Notify shipper that driver accepted
-      const updatedLoad = result.rows[0];
-      const driverResult = await pool.query('SELECT first_name, last_name FROM users WHERE id = $1', [req.user.id]);
-      const driverName = driverResult.rows[0] ? `${driverResult.rows[0].first_name} ${driverResult.rows[0].last_name || ''}`.trim() : 'Driver';
-      
-      notificationService.notifyShipperDriverAccepted(updatedLoad.shipper_id, driverName, {
-        loadId: updatedLoad.id,
-        deliveryCity: updatedLoad.delivery_city,
-      }).catch(err => console.error('[Notifications] Error:', err));
-
-      res.json({
-        message: 'Load accepted',
-        load: formatLoadResponse(result.rows[0]),
-      });
-    } catch (error) {
-      console.error('[Loads] Accept error:', error);
-      res.status(500).json({ error: 'Failed to accept load' });
-    }
-  }
-);
 
 /**
  * PUT /loads/:id/status
@@ -883,65 +1059,185 @@ router.put('/:id/status',
   authenticate,
   async (req, res) => {
     try {
-      const { status } = req.body;
+      const { status: newStatus } = req.body;
+      const loadId = req.params.id;
 
-      const validStatuses = ['en_route_pickup', 'at_pickup', 'picked_up', 'en_route_delivery', 'at_delivery', 'delivered', 'completed', 'cancelled'];
+      const validStatuses = [
+        'posted', 'assigned', 'accepted', 'confirmed',
+        'en_route_pickup', 'at_pickup', 'picked_up',
+        'en_route_delivery', 'at_delivery', 'delivered',
+        'completed', 'cancelled'
+      ];
 
-      if (!validStatuses.includes(status)) {
-        return res.status(400).json({ error: 'Invalid status' });
+      if (!validStatuses.includes(newStatus)) {
+        return res.status(400).json({ 
+          error: 'Invalid status',
+          validStatuses 
+        });
       }
 
-      // Get current load
-      const checkResult = await pool.query(
-        'SELECT * FROM loads WHERE id = $1 AND (driver_id = $2 OR shipper_id = $2)',
-        [req.params.id, req.user.id]
-      );
+      // Get user's org
+      const userOrg = await getUserPrimaryOrg(req.user.id);
 
-      if (checkResult.rows.length === 0) {
-        return res.status(404).json({ error: 'Load not found or access denied' });
+      // Verify ownership/access
+      const loadCheck = await pool.query(`
+        SELECT l.*, 
+          a.driver_user_id as assigned_driver_id,
+          a.carrier_org_id as assigned_carrier_id
+        FROM loads l
+        LEFT JOIN assignments a ON l.id = a.load_id AND a.status != 'cancelled'
+        WHERE l.id = $1
+      `, [loadId]);
+
+      if (loadCheck.rows.length === 0) {
+        return res.status(404).json({ error: 'Load not found' });
       }
 
-      // Update status with appropriate timestamp
-      let updateQuery = 'UPDATE loads SET status = $1, updated_at = CURRENT_TIMESTAMP';
-      
-      if (status === 'picked_up') {
-        updateQuery += ', picked_up_at = CURRENT_TIMESTAMP';
-      } else if (status === 'delivered') {
-        updateQuery += ', delivered_at = CURRENT_TIMESTAMP';
-      } else if (status === 'completed') {
-        updateQuery += ', completed_at = CURRENT_TIMESTAMP';
-      } else if (status === 'cancelled') {
-        updateQuery += ', cancelled_at = CURRENT_TIMESTAMP, cancelled_by = $3';
+      const load = loadCheck.rows[0];
+
+      // Check permissions based on role
+      const isShipperOwner = load.shipper_id === req.user.id || load.posted_by_org_id === userOrg?.org_id;
+      const isDriverOwner = load.driver_id === req.user.id || load.assigned_driver_id === req.user.id;
+      const isCarrierMember = userOrg?.org_type === 'carrier' && load.assigned_carrier_id === userOrg.org_id;
+
+      // Determine what status updates each role can make
+      const driverStatuses = ['en_route_pickup', 'at_pickup', 'picked_up', 'en_route_delivery', 'at_delivery', 'delivered'];
+      const shipperStatuses = ['completed', 'cancelled'];
+
+      if (driverStatuses.includes(newStatus) && !isDriverOwner && !isCarrierMember) {
+        return res.status(403).json({ error: 'Only the assigned driver can update to this status' });
       }
 
-      updateQuery += ' WHERE id = $2 RETURNING *';
+      if (shipperStatuses.includes(newStatus) && !isShipperOwner) {
+        return res.status(403).json({ error: 'Only the shipper can update to this status' });
+      }
 
-      const params = status === 'cancelled' 
-        ? [status, req.params.id, req.user.id]
-        : [status, req.params.id];
+      // Update timestamps based on status
+      let timestampField = null;
+      switch (newStatus) {
+        case 'assigned': timestampField = 'assigned_at'; break;
+        case 'picked_up': timestampField = 'picked_up_at'; break;
+        case 'delivered': timestampField = 'delivered_at'; break;
+        case 'completed': timestampField = 'completed_at'; break;
+        case 'cancelled': timestampField = 'cancelled_at'; break;
+      }
 
-      const result = await pool.query(updateQuery, params);
+      const updateQuery = timestampField
+        ? `UPDATE loads SET status = $1, ${timestampField} = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *`
+        : `UPDATE loads SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 RETURNING *`;
 
-      // Notify shipper of status change
-      const load = result.rows[0];
-      if (load.shipper_id && req.user.role === 'driver') {
-        const driverResult = await pool.query('SELECT first_name, last_name FROM users WHERE id = $1', [req.user.id]);
-        const driverName = driverResult.rows[0] ? `${driverResult.rows[0].first_name} ${driverResult.rows[0].last_name || ''}`.trim() : 'Driver';
+      const result = await pool.query(updateQuery, [newStatus, loadId]);
+
+      // Also update assignment status if exists
+      if (load.assigned_driver_id) {
+        const assignmentStatus = newStatus === 'delivered' ? 'completed' : 
+                                 newStatus === 'cancelled' ? 'cancelled' : 
+                                 ['en_route_pickup', 'at_pickup', 'picked_up', 'en_route_delivery', 'at_delivery'].includes(newStatus) ? 'in_progress' : 
+                                 'pending';
         
-        notificationService.notifyShipperStatusChange(load.shipper_id, status, driverName, {
-          loadId: load.id,
-          deliveryCity: load.delivery_city,
-          pickupCity: load.pickup_city,
-        }).catch(err => console.error('[Notifications] Status change error:', err));
+        await pool.query(`
+          UPDATE assignments 
+          SET status = $1, 
+              ${newStatus === 'delivered' ? 'completed_at = CURRENT_TIMESTAMP,' : ''}
+              ${['en_route_pickup'].includes(newStatus) ? 'started_at = CURRENT_TIMESTAMP,' : ''}
+              updated_at = CURRENT_TIMESTAMP
+          WHERE load_id = $2 AND status != 'cancelled'
+        `.replace(/,\s*updated_at/, ' updated_at'), [assignmentStatus, loadId]);
+      }
+
+      // Send notifications
+      if (newStatus === 'picked_up' && load.shipper_id) {
+        notificationService.notifyLoadPickedUp(load.shipper_id, loadId)
+          .catch(err => console.error('[Notifications] Pickup error:', err));
+      }
+      
+      if (newStatus === 'delivered' && load.shipper_id) {
+        notificationService.notifyLoadDelivered(load.shipper_id, loadId)
+          .catch(err => console.error('[Notifications] Delivery error:', err));
       }
 
       res.json({
-        message: `Status updated to ${status}`,
+        message: `Status updated to ${newStatus}`,
         load: formatLoadResponse(result.rows[0]),
       });
     } catch (error) {
       console.error('[Loads] Status update error:', error);
       res.status(500).json({ error: 'Failed to update status' });
+    }
+  }
+);
+
+/**
+ * POST /loads/:id/cancel
+ * Cancel a load
+ */
+router.post('/:id/cancel',
+  authenticate,
+  async (req, res) => {
+    try {
+      const { reason } = req.body;
+      const loadId = req.params.id;
+      const userOrg = await getUserPrimaryOrg(req.user.id);
+
+      // Verify ownership
+      const loadCheck = await pool.query(`
+        SELECT * FROM loads 
+        WHERE id = $1 
+          AND (shipper_id = $2 OR posted_by_org_id = $3)
+          AND status NOT IN ('delivered', 'completed', 'cancelled')
+      `, [loadId, req.user.id, userOrg?.org_id]);
+
+      if (loadCheck.rows.length === 0) {
+        return res.status(404).json({ error: 'Load not found or cannot be cancelled' });
+      }
+
+      const load = loadCheck.rows[0];
+
+      // Update load status
+      const result = await pool.query(`
+        UPDATE loads 
+        SET status = 'cancelled',
+            cancelled_at = CURRENT_TIMESTAMP,
+            cancelled_by = $1,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = $2
+        RETURNING *
+      `, [req.user.id, loadId]);
+
+      // Cancel any pending assignments
+      await pool.query(`
+        UPDATE assignments 
+        SET status = 'cancelled'
+        WHERE load_id = $1 AND status NOT IN ('completed', 'cancelled')
+      `, [loadId]);
+
+      // Cancel any pending offers
+      await pool.query(`
+        UPDATE offers 
+        SET status = 'cancelled'
+        WHERE load_id = $1 AND status = 'pending'
+      `, [loadId]);
+
+      // Notify driver if assigned
+      if (load.driver_id) {
+        notificationService.notifyLoadCancelled(load.driver_id, loadId, reason)
+          .catch(err => console.error('[Notifications] Cancel error:', err));
+      }
+
+      // Increment shipper cancellation count
+      await pool.query(`
+        UPDATE users 
+        SET shipper_cancellations = COALESCE(shipper_cancellations, 0) + 1
+        WHERE id = $1
+      `, [load.shipper_id]);
+
+      res.json({
+        message: 'Load cancelled',
+        load: formatLoadResponse(result.rows[0]),
+      });
+    } catch (error) {
+      console.error('[Loads] Cancel error:', error);
+      res.status(500).json({ error: 'Failed to cancel load' });
     }
   }
 );
@@ -1102,15 +1398,20 @@ function formatLoadResponse(load, detailed = false) {
     shipperRated: load.shipper_rated || false,
     equipmentType: load.equipment_type || load.vehicle_type_required,
     vehicleTypeRequired: load.vehicle_type_required,
-    // NEW: Org context
+    // Org context
     postedByOrgId: load.posted_by_org_id,
     postedByUserId: load.posted_by_user_id,
-    // NEW: Booking options
+    // Booking options
     allowOffers: load.allow_offers !== false,
     allowBookNow: load.allow_book_now !== false,
     minOffer: load.min_offer ? parseFloat(load.min_offer) : null,
     verifiedOnly: load.verified_only || false,
     trackingRequired: load.tracking_required !== false,
+    // Visibility & Tendering
+    visibility: load.visibility || 'public',
+    preferredWindowMinutes: load.preferred_window_minutes,
+    releaseToPublicAt: load.release_to_public_at,
+    releasedEarlyAt: load.released_early_at,
   };
 
   // Broker fields (only if present)

@@ -78,8 +78,13 @@ router.get('/carriers', authenticate, requireBroker, async (req, res) => {
     let paramIndex = 2;
 
     if (status) {
-      whereClause += ` AND bc.status = $${paramIndex++}`;
-      params.push(status);
+      // Handle 'pending' as a group of statuses
+      if (status === 'pending') {
+        whereClause += ` AND bc.status IN ('pending_carrier', 'pending_broker', 'external_invite')`;
+      } else {
+        whereClause += ` AND bc.status = $${paramIndex++}`;
+        params.push(status);
+      }
     }
 
     if (preferred === 'true') {
@@ -119,7 +124,7 @@ router.get('/carriers', authenticate, requireBroker, async (req, res) => {
     const countResult = await pool.query(`
       SELECT 
         COUNT(*) FILTER (WHERE status = 'active') as active_count,
-        COUNT(*) FILTER (WHERE status = 'pending') as pending_count,
+        COUNT(*) FILTER (WHERE status IN ('pending_carrier', 'pending_broker', 'external_invite')) as pending_count,
         COUNT(*) FILTER (WHERE status = 'blocked') as blocked_count,
         COUNT(*) FILTER (WHERE is_preferred = true AND status = 'active') as preferred_count,
         COUNT(*) as total_count
@@ -252,7 +257,8 @@ router.get('/carriers/org/:orgId', authenticate, requireBroker, async (req, res)
 
     // Check if already in network
     const networkResult = await pool.query(`
-      SELECT id, status, is_preferred, loads_completed, notes
+      SELECT id, status, is_preferred, loads_completed, notes, total_paid,
+             on_time_count, late_count, last_load_at
       FROM broker_carriers
       WHERE broker_org_id = $1 AND carrier_org_id = $2
     `, [req.brokerOrg.id, orgId]);
@@ -265,6 +271,57 @@ router.get('/carriers/org/:orgId', authenticate, requireBroker, async (req, res)
       SELECT * FROM trust_signals WHERE org_id = $1
     `, [orgId]);
     const trustSignals = trustResult.rows[0] || null;
+
+    // Get fleet info (aggregate driver vehicle types)
+    const fleetResult = await pool.query(`
+      SELECT 
+        COALESCE(u.vehicle_type, 'Unknown') as equipment_type,
+        COUNT(*) as count
+      FROM memberships m
+      JOIN users u ON m.user_id = u.id
+      WHERE m.org_id = $1 AND m.role = 'driver' AND m.is_active = true
+        AND u.vehicle_type IS NOT NULL AND u.vehicle_type != ''
+      GROUP BY u.vehicle_type
+      ORDER BY count DESC
+    `, [orgId]);
+
+    // Get service areas (states from completed loads)
+    const serviceAreasResult = await pool.query(`
+      SELECT DISTINCT 
+        COALESCE(pickup_state, delivery_state) as state
+      FROM loads
+      WHERE assigned_carrier_org_id = $1 
+        AND status = 'completed'
+        AND (pickup_state IS NOT NULL OR delivery_state IS NOT NULL)
+      LIMIT 10
+    `, [orgId]);
+
+    // Get recent loads together (between this broker and carrier)
+    let recentLoads = [];
+    if (inNetwork) {
+      const loadsResult = await pool.query(`
+        SELECT 
+          l.id, l.pickup_city, l.pickup_state, 
+          l.delivery_city, l.delivery_state,
+          l.status, l.completed_at, l.carrier_pay
+        FROM loads l
+        WHERE l.posted_by_org_id = $1 
+          AND l.assigned_carrier_org_id = $2
+          AND l.status IN ('completed', 'delivered')
+        ORDER BY l.completed_at DESC NULLS LAST
+        LIMIT 10
+      `, [req.brokerOrg.id, orgId]);
+      recentLoads = loadsResult.rows;
+    }
+
+    // Calculate on-time rate from network record if available
+    let onTimeRate = org.on_time_rate ? parseFloat(org.on_time_rate) : null;
+    if (networkRecord && (networkRecord.on_time_count || networkRecord.late_count)) {
+      const total = (networkRecord.on_time_count || 0) + (networkRecord.late_count || 0);
+      if (total > 0) {
+        onTimeRate = Math.round((networkRecord.on_time_count / total) * 100);
+      }
+    }
 
     res.json({
       carrier: {
@@ -283,7 +340,7 @@ router.get('/carriers/org/:orgId', authenticate, requireBroker, async (req, res)
         verificationStatus: org.verification_status,
         verifiedAt: org.verified_at,
         loadsCompleted: org.loads_completed,
-        onTimeRate: org.on_time_rate ? parseFloat(org.on_time_rate) : null,
+        onTimeRate: onTimeRate,
         claimRate: org.claim_rate ? parseFloat(org.claim_rate) : null,
         driverCount: parseInt(org.driver_count) || 0,
         trustSignals: trustSignals ? {
@@ -307,8 +364,27 @@ router.get('/carriers/org/:orgId', authenticate, requireBroker, async (req, res)
         status: networkRecord.status,
         isPreferred: networkRecord.is_preferred,
         loadsCompleted: networkRecord.loads_completed,
+        totalPaid: networkRecord.total_paid ? parseFloat(networkRecord.total_paid) : 0,
+        onTimeCount: networkRecord.on_time_count,
+        lateCount: networkRecord.late_count,
+        lastLoadAt: networkRecord.last_load_at,
         notes: networkRecord.notes,
       } : null,
+      fleet: fleetResult.rows.map(f => ({
+        equipment_type: f.equipment_type,
+        count: parseInt(f.count)
+      })),
+      serviceAreas: serviceAreasResult.rows.map(s => ({ state: s.state })),
+      recentLoads: recentLoads.map(l => ({
+        id: l.id,
+        pickup_city: l.pickup_city,
+        pickup_state: l.pickup_state,
+        delivery_city: l.delivery_city,
+        delivery_state: l.delivery_state,
+        status: l.status,
+        completed_at: l.completed_at,
+        carrier_pay: l.carrier_pay ? parseFloat(l.carrier_pay) : 0
+      })),
     });
   } catch (error) {
     console.error('[Broker] Get carrier org error:', error);
@@ -1212,6 +1288,98 @@ router.post('/connection-requests/:id/retry', authenticate, requireBroker, requi
     res.status(500).json({ error: 'Failed to retry connection request' });
   } finally {
     client.release();
+  }
+});
+
+// ============================================
+// BROKER'S OWN LOADS
+// ============================================
+
+/**
+ * GET /broker/loads
+ * Get loads posted by broker's org (for "My Loads" tab)
+ */
+router.get('/loads', authenticate, requireBroker, async (req, res) => {
+  try {
+    const { status, limit = 50, offset = 0 } = req.query;
+
+    let whereClause = 'WHERE l.posted_by_org_id = $1';
+    const params = [req.brokerOrg.id];
+    let paramIndex = 2;
+
+    if (status && status !== 'all') {
+      whereClause += ` AND l.status = $${paramIndex++}`;
+      params.push(status);
+    }
+
+    params.push(parseInt(limit), parseInt(offset));
+
+    const result = await pool.query(`
+      SELECT l.*, 
+        CONCAT(u.first_name, ' ', u.last_name) as driver_name,
+        u.phone as driver_phone,
+        (SELECT COUNT(*) FROM offers WHERE load_id = l.id AND status = 'pending') as offers_count,
+        a.status as assignment_status,
+        a.carrier_org_id,
+        co.name as carrier_name
+      FROM loads l
+      LEFT JOIN users u ON l.driver_id = u.id
+      LEFT JOIN assignments a ON l.id = a.load_id
+      LEFT JOIN orgs co ON a.carrier_org_id = co.id
+      ${whereClause}
+      ORDER BY l.created_at DESC
+      LIMIT $${paramIndex++} OFFSET $${paramIndex}
+    `, params);
+
+    // Get counts by status
+    const countsResult = await pool.query(`
+      SELECT 
+        COUNT(*) FILTER (WHERE status = 'posted') as posted_count,
+        COUNT(*) FILTER (WHERE status = 'assigned') as assigned_count,
+        COUNT(*) FILTER (WHERE status IN ('en_route_pickup', 'picked_up', 'en_route_delivery')) as in_transit_count,
+        COUNT(*) FILTER (WHERE status = 'delivered') as delivered_count,
+        COUNT(*) FILTER (WHERE status = 'completed') as completed_count,
+        COUNT(*) as total_count
+      FROM loads
+      WHERE posted_by_org_id = $1
+    `, [req.brokerOrg.id]);
+
+    res.json({
+      loads: result.rows.map(row => ({
+        id: row.id,
+        status: row.status,
+        loadType: row.load_type,
+        description: row.description,
+        pickupCity: row.pickup_city,
+        pickupState: row.pickup_state,
+        pickupDate: row.pickup_date,
+        deliveryCity: row.delivery_city,
+        deliveryState: row.delivery_state,
+        deliveryDate: row.delivery_date,
+        price: row.price ? parseFloat(row.price) : null,
+        carrierPay: row.carrier_pay ? parseFloat(row.carrier_pay) : null,
+        distanceMiles: row.distance_miles ? parseFloat(row.distance_miles) : null,
+        equipmentType: row.vehicle_type_required,
+        postedAt: row.posted_at,
+        createdAt: row.created_at,
+        offersCount: parseInt(row.offers_count) || 0,
+        assignmentStatus: row.assignment_status,
+        carrierOrgId: row.carrier_org_id,
+        carrierName: row.carrier_name,
+        driverName: row.driver_name,
+        driverPhone: row.driver_phone,
+        // Broker-specific fields
+        customerName: row.customer_name,
+        customerLoadNumber: row.customer_load_number,
+        customerPo: row.customer_po,
+        customerRate: row.customer_rate ? parseFloat(row.customer_rate) : null,
+      })),
+      counts: countsResult.rows[0],
+      pagination: { limit: parseInt(limit), offset: parseInt(offset) }
+    });
+  } catch (error) {
+    console.error('[Broker] Get loads error:', error);
+    res.status(500).json({ error: 'Failed to get loads' });
   }
 });
 
