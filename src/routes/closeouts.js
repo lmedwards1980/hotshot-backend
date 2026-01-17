@@ -6,7 +6,7 @@ const { pool } = require('../db/pool');
 const { authenticate } = require('../middleware/auth');
 let notificationService;
 try {
-  notificationService = require('../services/notificationService');
+  notificationService = require('../services/notifications');
 } catch (e) {
   console.warn('[Closeouts] Notification service not available');
   notificationService = { sendPushNotification: async () => {} };
