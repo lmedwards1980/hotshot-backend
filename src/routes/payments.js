@@ -1163,4 +1163,317 @@ router.delete('/cards/:id', authenticate, async (req, res) => {
   }
 });
 
+// ============================================
+// BILLING ADDRESS (Shipper)
+// ============================================
+
+/**
+ * GET /payments/billing-address
+ * Get shipper's billing address
+ */
+router.get('/billing-address', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        billing_address_line1,
+        billing_address_line2,
+        billing_city,
+        billing_state,
+        billing_postal_code,
+        billing_country
+      FROM users
+      WHERE id = $1
+    `, [req.user.id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const user = result.rows[0];
+
+    res.json({
+      addressLine1: user.billing_address_line1 || '',
+      addressLine2: user.billing_address_line2 || '',
+      city: user.billing_city || '',
+      state: user.billing_state || '',
+      postalCode: user.billing_postal_code || '',
+      country: user.billing_country || 'US',
+    });
+  } catch (error) {
+    console.error('[Payments] Get billing address error:', error);
+    res.status(500).json({ error: 'Failed to get billing address' });
+  }
+});
+
+/**
+ * PUT /payments/billing-address
+ * Update shipper's billing address
+ */
+router.put('/billing-address', authenticate, async (req, res) => {
+  try {
+    const {
+      addressLine1,
+      addressLine2,
+      city,
+      state,
+      postalCode,
+      country = 'US',
+    } = req.body;
+
+    // Validate required fields
+    if (!addressLine1 || !city || !state || !postalCode) {
+      return res.status(400).json({
+        error: 'Address line 1, city, state, and postal code are required'
+      });
+    }
+
+    await pool.query(`
+      UPDATE users
+      SET
+        billing_address_line1 = $1,
+        billing_address_line2 = $2,
+        billing_city = $3,
+        billing_state = $4,
+        billing_postal_code = $5,
+        billing_country = $6,
+        updated_at = NOW()
+      WHERE id = $7
+    `, [addressLine1, addressLine2 || null, city, state, postalCode, country, req.user.id]);
+
+    // Update Stripe customer billing address if exists
+    const userResult = await pool.query(
+      'SELECT stripe_customer_id FROM users WHERE id = $1',
+      [req.user.id]
+    );
+
+    if (userResult.rows[0]?.stripe_customer_id) {
+      try {
+        await stripeService.stripe.customers.update(userResult.rows[0].stripe_customer_id, {
+          address: {
+            line1: addressLine1,
+            line2: addressLine2 || undefined,
+            city: city,
+            state: state,
+            postal_code: postalCode,
+            country: country,
+          },
+        });
+      } catch (stripeError) {
+        console.error('[Payments] Failed to update Stripe billing address:', stripeError.message);
+        // Continue - local update succeeded
+      }
+    }
+
+    res.json({
+      message: 'Billing address updated',
+      addressLine1,
+      addressLine2: addressLine2 || '',
+      city,
+      state,
+      postalCode,
+      country,
+    });
+  } catch (error) {
+    console.error('[Payments] Update billing address error:', error);
+    res.status(500).json({ error: 'Failed to update billing address' });
+  }
+});
+
+// ============================================
+// INVOICES & PAYMENT HISTORY (Shipper)
+// ============================================
+
+/**
+ * GET /payments/invoices
+ * Get shipper's invoices for loads
+ */
+router.get('/invoices', authenticate, async (req, res) => {
+  try {
+    const { status, limit = 20, offset = 0 } = req.query;
+
+    let statusFilter = '';
+    const values = [req.user.id, parseInt(limit), parseInt(offset)];
+
+    if (status) {
+      statusFilter = 'AND l.payment_status = $4';
+      values.push(status);
+    }
+
+    const result = await pool.query(`
+      SELECT
+        l.id as load_id,
+        l.pickup_city,
+        l.pickup_state,
+        l.delivery_city,
+        l.delivery_state,
+        l.price,
+        l.payment_status,
+        l.stripe_payment_intent_id,
+        l.created_at as load_created_at,
+        l.delivered_at,
+        l.status as load_status,
+        u.first_name as driver_first_name,
+        u.last_name as driver_last_name,
+        u.company_name as carrier_name
+      FROM loads l
+      LEFT JOIN users u ON l.driver_id = u.id
+      WHERE l.shipper_id = $1
+      AND l.price > 0
+      ${statusFilter}
+      ORDER BY l.created_at DESC
+      LIMIT $2 OFFSET $3
+    `, values);
+
+    // Get total count
+    const countValues = [req.user.id];
+    let countStatusFilter = '';
+    if (status) {
+      countStatusFilter = 'AND payment_status = $2';
+      countValues.push(status);
+    }
+
+    const countResult = await pool.query(`
+      SELECT COUNT(*) as total
+      FROM loads
+      WHERE shipper_id = $1 AND price > 0
+      ${countStatusFilter}
+    `, countValues);
+
+    const invoices = result.rows.map(row => ({
+      id: `INV-${row.load_id.substring(0, 8).toUpperCase()}`,
+      loadId: row.load_id,
+      route: `${row.pickup_city}, ${row.pickup_state} → ${row.delivery_city}, ${row.delivery_state}`,
+      amount: parseFloat(row.price),
+      status: row.payment_status || 'pending',
+      loadStatus: row.load_status,
+      driverName: row.driver_first_name ? `${row.driver_first_name} ${row.driver_last_name || ''}`.trim() : null,
+      carrierName: row.carrier_name,
+      createdAt: row.load_created_at,
+      deliveredAt: row.delivered_at,
+      paymentIntentId: row.stripe_payment_intent_id,
+    }));
+
+    res.json({
+      invoices,
+      pagination: {
+        total: parseInt(countResult.rows[0].total),
+        limit: parseInt(limit),
+        offset: parseInt(offset),
+      },
+    });
+  } catch (error) {
+    console.error('[Payments] Get invoices error:', error);
+    res.status(500).json({ error: 'Failed to get invoices' });
+  }
+});
+
+/**
+ * GET /payments/history
+ * Get payment history (transactions)
+ */
+router.get('/history', authenticate, async (req, res) => {
+  try {
+    const { limit = 20, offset = 0 } = req.query;
+    const userType = req.user.role || req.user.user_type;
+
+    let result;
+
+    if (userType === 'shipper' || userType === 'broker') {
+      // Shipper: Get payments made for loads
+      result = await pool.query(`
+        SELECT
+          l.id as load_id,
+          l.pickup_city,
+          l.pickup_state,
+          l.delivery_city,
+          l.delivery_state,
+          l.price as amount,
+          l.payment_status as status,
+          l.stripe_payment_intent_id as transaction_id,
+          l.updated_at as transaction_date,
+          'load_payment' as type
+        FROM loads l
+        WHERE l.shipper_id = $1
+        AND l.payment_status IN ('authorized', 'captured', 'paid', 'refunded', 'partially_refunded')
+        ORDER BY l.updated_at DESC
+        LIMIT $2 OFFSET $3
+      `, [req.user.id, parseInt(limit), parseInt(offset)]);
+    } else {
+      // Driver: Get payouts received
+      result = await pool.query(`
+        SELECT
+          l.id as load_id,
+          l.pickup_city,
+          l.pickup_state,
+          l.delivery_city,
+          l.delivery_state,
+          l.driver_payout as amount,
+          l.payout_status as status,
+          l.stripe_transfer_id as transaction_id,
+          l.payout_at as transaction_date,
+          'payout' as type
+        FROM loads l
+        WHERE l.driver_id = $1
+        AND l.payout_status IS NOT NULL
+        ORDER BY l.payout_at DESC NULLS LAST
+        LIMIT $2 OFFSET $3
+      `, [req.user.id, parseInt(limit), parseInt(offset)]);
+    }
+
+    // Also get payout_history for drivers
+    let payoutHistory = [];
+    if (userType === 'driver') {
+      const payoutResult = await pool.query(`
+        SELECT
+          id,
+          amount,
+          type,
+          status,
+          stripe_payout_id as transaction_id,
+          created_at as transaction_date,
+          fee,
+          arrival_date
+        FROM payout_history
+        WHERE user_id = $1
+        ORDER BY created_at DESC
+        LIMIT $2 OFFSET $3
+      `, [req.user.id, parseInt(limit), parseInt(offset)]);
+
+      payoutHistory = payoutResult.rows.map(row => ({
+        id: row.id,
+        type: row.type === 'instant' ? 'instant_payout' : 'standard_payout',
+        amount: parseFloat(row.amount),
+        fee: parseFloat(row.fee) || 0,
+        status: row.status,
+        transactionId: row.transaction_id,
+        transactionDate: row.transaction_date,
+        arrivalDate: row.arrival_date,
+      }));
+    }
+
+    const transactions = result.rows.map(row => ({
+      id: row.load_id,
+      type: row.type,
+      route: row.pickup_city ? `${row.pickup_city}, ${row.pickup_state} → ${row.delivery_city}, ${row.delivery_state}` : null,
+      amount: parseFloat(row.amount),
+      status: row.status,
+      transactionId: row.transaction_id,
+      transactionDate: row.transaction_date,
+    }));
+
+    res.json({
+      transactions: [...transactions, ...payoutHistory].sort((a, b) =>
+        new Date(b.transactionDate) - new Date(a.transactionDate)
+      ).slice(0, parseInt(limit)),
+      pagination: {
+        limit: parseInt(limit),
+        offset: parseInt(offset),
+      },
+    });
+  } catch (error) {
+    console.error('[Payments] Get history error:', error);
+    res.status(500).json({ error: 'Failed to get payment history' });
+  }
+});
+
 module.exports = router;

@@ -84,6 +84,22 @@ const runMigrationsV2 = async () => {
       console.log('[DB] Driver profile columns check completed');
     }
 
+    // Add billing address columns to users table (for shippers)
+    try {
+      await pool.query(`
+        ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS billing_address_line1 VARCHAR(255),
+        ADD COLUMN IF NOT EXISTS billing_address_line2 VARCHAR(255),
+        ADD COLUMN IF NOT EXISTS billing_city VARCHAR(100),
+        ADD COLUMN IF NOT EXISTS billing_state VARCHAR(2),
+        ADD COLUMN IF NOT EXISTS billing_postal_code VARCHAR(20),
+        ADD COLUMN IF NOT EXISTS billing_country VARCHAR(2) DEFAULT 'US'
+      `);
+      console.log('[DB] ✓ billing address columns added to users');
+    } catch (e) {
+      console.log('[DB] Billing address columns check completed');
+    }
+
     // Payout History table (for tracking payout requests)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS payout_history (
