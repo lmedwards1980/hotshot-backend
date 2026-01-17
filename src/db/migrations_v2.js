@@ -23,7 +23,126 @@ const { pool } = require('./pool');
 const runMigrationsV2 = async () => {
   try {
     console.log('[DB] Running v2 migrations...');
-    // Migrations handled by PostgreSQL plugin
+
+    // Password Reset Codes table (for forgot password flow)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS password_reset_codes (
+        id SERIAL PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        code VARCHAR(6) NOT NULL,
+        reset_token VARCHAR(64),
+        expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        attempts INTEGER DEFAULT 0,
+        verified_at TIMESTAMP WITH TIME ZONE,
+        used_at TIMESTAMP WITH TIME ZONE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    console.log('[DB] ✓ password_reset_codes table ready');
+
+    // Create indexes if they don't exist
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_password_reset_codes_user_id ON password_reset_codes(user_id)
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_password_reset_codes_code ON password_reset_codes(code)
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_password_reset_codes_reset_token ON password_reset_codes(reset_token)
+    `);
+
+    // Add payout settings columns to users table
+    try {
+      await pool.query(`
+        ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS payout_schedule VARCHAR(20) DEFAULT 'daily',
+        ADD COLUMN IF NOT EXISTS instant_payout_enabled BOOLEAN DEFAULT false,
+        ADD COLUMN IF NOT EXISTS default_payout_method VARCHAR(255)
+      `);
+      console.log('[DB] ✓ payout settings columns added to users');
+    } catch (e) {
+      // Columns may already exist
+      console.log('[DB] Payout columns check completed');
+    }
+
+    // Add driver profile columns to users table
+    try {
+      await pool.query(`
+        ALTER TABLE users
+        ADD COLUMN IF NOT EXISTS has_cdl BOOLEAN DEFAULT false,
+        ADD COLUMN IF NOT EXISTS cdl_number VARCHAR(50),
+        ADD COLUMN IF NOT EXISTS cdl_state VARCHAR(2),
+        ADD COLUMN IF NOT EXISTS cdl_expiration DATE,
+        ADD COLUMN IF NOT EXISTS insurance_provider VARCHAR(255),
+        ADD COLUMN IF NOT EXISTS insurance_policy_number VARCHAR(100),
+        ADD COLUMN IF NOT EXISTS insurance_expiration DATE,
+        ADD COLUMN IF NOT EXISTS bio TEXT,
+        ADD COLUMN IF NOT EXISTS profile_picture_url TEXT
+      `);
+      console.log('[DB] ✓ driver profile columns added to users');
+    } catch (e) {
+      console.log('[DB] Driver profile columns check completed');
+    }
+
+    // Payout History table (for tracking payout requests)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS payout_history (
+        id SERIAL PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        amount DECIMAL(10, 2) NOT NULL,
+        type VARCHAR(20) NOT NULL DEFAULT 'standard',
+        status VARCHAR(20) NOT NULL DEFAULT 'pending',
+        stripe_payout_id VARCHAR(255),
+        fee DECIMAL(10, 2) DEFAULT 0,
+        arrival_date TIMESTAMP WITH TIME ZONE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    console.log('[DB] ✓ payout_history table ready');
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_payout_history_user_id ON payout_history(user_id)
+    `);
+
+    // Ensure driver_documents table has required columns
+    try {
+      await pool.query(`
+        ALTER TABLE driver_documents
+        ADD COLUMN IF NOT EXISTS file_url TEXT,
+        ADD COLUMN IF NOT EXISTS file_name VARCHAR(255)
+      `);
+      console.log('[DB] ✓ driver_documents columns updated');
+    } catch (e) {
+      // Table might not exist or columns already exist
+      console.log('[DB] driver_documents columns check completed');
+    }
+
+    // Driver Ratings table (ratings from shippers to drivers)
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS driver_ratings (
+        id SERIAL PRIMARY KEY,
+        load_id UUID NOT NULL REFERENCES loads(id) ON DELETE CASCADE,
+        driver_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        shipper_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        rating INTEGER NOT NULL CHECK (rating >= 1 AND rating <= 5),
+        comment TEXT,
+        tags JSONB,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(load_id, shipper_id)
+      )
+    `);
+    console.log('[DB] ✓ driver_ratings table ready');
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_driver_ratings_driver_id ON driver_ratings(driver_id)
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_driver_ratings_shipper_id ON driver_ratings(shipper_id)
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_driver_ratings_load_id ON driver_ratings(load_id)
+    `);
+
     console.log('[DB] V2 migrations complete!');
   } catch (error) {
     console.error('[DB] V2 migration error:', error);

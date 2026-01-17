@@ -212,6 +212,119 @@ router.get('/shipper/:shipperId',
 );
 
 /**
+ * GET /ratings/driver/:driverId
+ * Get ratings received by a specific driver (from shippers)
+ * Called by driver app at: /drivers/{userId}/ratings
+ */
+router.get('/driver/:driverId',
+  authenticate,
+  async (req, res) => {
+    try {
+      const { driverId } = req.params;
+      const { limit = 20, offset = 0 } = req.query;
+
+      // Get driver info with rating
+      const driverResult = await pool.query(`
+        SELECT
+          id,
+          first_name,
+          last_name,
+          profile_picture_url,
+          rating,
+          rating_count,
+          vehicle_type
+        FROM users
+        WHERE id = $1 AND role = 'driver'
+      `, [driverId]);
+
+      if (driverResult.rows.length === 0) {
+        return res.status(404).json({ error: 'Driver not found' });
+      }
+
+      const driver = driverResult.rows[0];
+
+      // Get ratings received by this driver
+      const ratingsResult = await pool.query(`
+        SELECT
+          dr.id,
+          dr.rating,
+          dr.comment,
+          dr.tags,
+          dr.created_at,
+          l.id as load_id,
+          l.pickup_city,
+          l.pickup_state,
+          l.delivery_city,
+          l.delivery_state,
+          l.delivered_at,
+          u.company_name as shipper_name,
+          u.first_name as shipper_first_name
+        FROM driver_ratings dr
+        JOIN loads l ON dr.load_id = l.id
+        LEFT JOIN users u ON dr.shipper_id = u.id
+        WHERE dr.driver_id = $1
+        ORDER BY dr.created_at DESC
+        LIMIT $2 OFFSET $3
+      `, [driverId, parseInt(limit), parseInt(offset)]);
+
+      // Get rating distribution
+      const distributionResult = await pool.query(`
+        SELECT
+          rating,
+          COUNT(*) as count
+        FROM driver_ratings
+        WHERE driver_id = $1
+        GROUP BY rating
+        ORDER BY rating DESC
+      `, [driverId]);
+
+      // Build distribution object (5, 4, 3, 2, 1 stars)
+      const distribution = { 5: 0, 4: 0, 3: 0, 2: 0, 1: 0 };
+      distributionResult.rows.forEach(row => {
+        distribution[row.rating] = parseInt(row.count);
+      });
+
+      // Get total count for pagination
+      const countResult = await pool.query(
+        'SELECT COUNT(*) as total FROM driver_ratings WHERE driver_id = $1',
+        [driverId]
+      );
+
+      res.json({
+        driver: {
+          id: driver.id,
+          name: `${driver.first_name} ${driver.last_name || ''}`.trim(),
+          profilePictureUrl: driver.profile_picture_url,
+          rating: parseFloat(driver.rating) || 0,
+          ratingCount: parseInt(driver.rating_count) || 0,
+          vehicleType: driver.vehicle_type,
+        },
+        ratings: ratingsResult.rows.map(r => ({
+          id: r.id,
+          rating: r.rating,
+          comment: r.comment,
+          tags: r.tags,
+          createdAt: r.created_at,
+          loadId: r.load_id,
+          route: `${r.pickup_city}, ${r.pickup_state} → ${r.delivery_city}, ${r.delivery_state}`,
+          deliveredAt: r.delivered_at,
+          shipperName: r.shipper_name || r.shipper_first_name || 'Anonymous',
+        })),
+        distribution,
+        pagination: {
+          total: parseInt(countResult.rows[0].total),
+          limit: parseInt(limit),
+          offset: parseInt(offset),
+        },
+      });
+    } catch (error) {
+      console.error('[Ratings] Driver ratings fetch error:', error);
+      res.status(500).json({ error: 'Failed to fetch driver ratings' });
+    }
+  }
+);
+
+/**
  * GET /ratings/my-ratings
  * Get ratings submitted by the current driver
  */

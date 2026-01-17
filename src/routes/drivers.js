@@ -70,6 +70,346 @@ router.get('/profile', authenticate, async (req, res) => {
 });
 
 // ============================================
+// PUT /api/drivers/profile
+// Update driver's profile
+// ============================================
+
+router.put('/profile', authenticate, async (req, res) => {
+  try {
+    const {
+      firstName,
+      lastName,
+      phone,
+      vehicleType,
+      licensePlate,
+      companyName,
+      hasCdl,
+      cdlNumber,
+      cdlState,
+      cdlExpiration,
+      insuranceProvider,
+      insurancePolicyNumber,
+      insuranceExpiration,
+      bio,
+    } = req.body;
+
+    // Build dynamic update query
+    const updates = [];
+    const values = [];
+    let paramIndex = 1;
+
+    const addUpdate = (field, value) => {
+      if (value !== undefined) {
+        updates.push(`${field} = $${paramIndex}`);
+        values.push(value);
+        paramIndex++;
+      }
+    };
+
+    addUpdate('first_name', firstName);
+    addUpdate('last_name', lastName);
+    addUpdate('phone', phone);
+    addUpdate('vehicle_type', vehicleType);
+    addUpdate('license_plate', licensePlate);
+    addUpdate('company_name', companyName);
+    addUpdate('has_cdl', hasCdl);
+    addUpdate('cdl_number', cdlNumber);
+    addUpdate('cdl_state', cdlState);
+    addUpdate('cdl_expiration', cdlExpiration);
+    addUpdate('insurance_provider', insuranceProvider);
+    addUpdate('insurance_policy_number', insurancePolicyNumber);
+    addUpdate('insurance_expiration', insuranceExpiration);
+    addUpdate('bio', bio);
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    updates.push('updated_at = NOW()');
+    values.push(req.user.id);
+
+    const result = await pool.query(`
+      UPDATE users
+      SET ${updates.join(', ')}
+      WHERE id = $${paramIndex}
+      RETURNING
+        id, email, phone, first_name, last_name,
+        vehicle_type, license_plate, company_name,
+        has_cdl, cdl_number, cdl_state, cdl_expiration,
+        insurance_provider, insurance_policy_number, insurance_expiration,
+        bio, profile_picture_url, rating, rating_count
+    `, values);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Driver not found' });
+    }
+
+    const user = result.rows[0];
+
+    res.json({
+      message: 'Profile updated successfully',
+      driver: {
+        id: user.id,
+        email: user.email,
+        phone: user.phone,
+        firstName: user.first_name,
+        lastName: user.last_name,
+        vehicleType: user.vehicle_type,
+        licensePlate: user.license_plate,
+        companyName: user.company_name,
+        hasCdl: user.has_cdl,
+        cdlNumber: user.cdl_number,
+        cdlState: user.cdl_state,
+        cdlExpiration: user.cdl_expiration,
+        insuranceProvider: user.insurance_provider,
+        insurancePolicyNumber: user.insurance_policy_number,
+        insuranceExpiration: user.insurance_expiration,
+        bio: user.bio,
+        profilePictureUrl: user.profile_picture_url,
+        rating: user.rating,
+        ratingCount: user.rating_count,
+      },
+    });
+  } catch (error) {
+    console.error('[Drivers] Update profile error:', error);
+    res.status(500).json({ error: 'Failed to update profile' });
+  }
+});
+
+// ============================================
+// POST /api/drivers/profile/photo
+// Upload driver's profile photo
+// ============================================
+
+router.post('/profile/photo', authenticate, async (req, res) => {
+  try {
+    const { url, base64 } = req.body;
+
+    let photoUrl = url;
+
+    // If base64 image provided, we would upload to S3 here
+    // For now, we accept either a direct URL or note that S3 upload would happen
+    if (base64 && !url) {
+      // TODO: Upload base64 to S3 and get URL
+      // const s3Service = require('../services/s3Service');
+      // photoUrl = await s3Service.uploadBase64Image(base64, `drivers/${req.user.id}/profile`);
+      return res.status(400).json({
+        error: 'Base64 upload not yet implemented. Please provide a URL.',
+        hint: 'Use presigned URL upload via /documents/upload-url endpoint'
+      });
+    }
+
+    if (!photoUrl) {
+      return res.status(400).json({ error: 'Photo URL is required' });
+    }
+
+    // Update the profile picture URL
+    const result = await pool.query(`
+      UPDATE users
+      SET profile_picture_url = $1, updated_at = NOW()
+      WHERE id = $2
+      RETURNING id, profile_picture_url
+    `, [photoUrl, req.user.id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Driver not found' });
+    }
+
+    res.json({
+      message: 'Profile photo updated successfully',
+      url: result.rows[0].profile_picture_url,
+    });
+  } catch (error) {
+    console.error('[Drivers] Upload photo error:', error);
+    res.status(500).json({ error: 'Failed to upload profile photo' });
+  }
+});
+
+// ============================================
+// DRIVER DOCUMENTS
+// These endpoints match what the driver app expects
+// ============================================
+
+/**
+ * GET /api/drivers/documents
+ * Get list of driver's uploaded documents
+ */
+router.get('/documents', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        id,
+        document_type as type,
+        file_url as url,
+        file_name as fileName,
+        status,
+        expires_at as expiresAt,
+        uploaded_at as uploadedAt,
+        reviewed_at as reviewedAt,
+        rejection_reason as rejectionReason
+      FROM driver_documents
+      WHERE user_id = $1
+      ORDER BY uploaded_at DESC
+    `, [req.user.id]);
+
+    // Define required document types
+    const requiredTypes = [
+      'drivers_license',
+      'vehicle_registration',
+      'insurance_certificate',
+      'profile_photo'
+    ];
+
+    // Map documents by type
+    const documentsByType = {};
+    result.rows.forEach(doc => {
+      documentsByType[doc.type] = {
+        id: doc.id,
+        type: doc.type,
+        url: doc.url,
+        fileName: doc.filename,
+        status: doc.status,
+        expiresAt: doc.expiresat,
+        uploadedAt: doc.uploadedat,
+        reviewedAt: doc.reviewedat,
+        rejectionReason: doc.rejectionreason,
+      };
+    });
+
+    // Build response with all required types
+    const documents = requiredTypes.map(type => ({
+      type,
+      required: true,
+      ...(documentsByType[type] || { status: 'missing' }),
+    }));
+
+    // Calculate completion status
+    const uploadedCount = result.rows.length;
+    const approvedCount = result.rows.filter(d => d.status === 'approved').length;
+    const pendingCount = result.rows.filter(d => d.status === 'pending').length;
+    const rejectedCount = result.rows.filter(d => d.status === 'rejected').length;
+
+    res.json({
+      documents,
+      summary: {
+        required: requiredTypes.length,
+        uploaded: uploadedCount,
+        approved: approvedCount,
+        pending: pendingCount,
+        rejected: rejectedCount,
+        complete: approvedCount === requiredTypes.length,
+      },
+    });
+  } catch (error) {
+    console.error('[Drivers] Get documents error:', error);
+    res.status(500).json({ error: 'Failed to get documents' });
+  }
+});
+
+/**
+ * POST /api/drivers/documents
+ * Upload a new document (accepts URL or triggers presigned URL flow)
+ */
+router.post('/documents', authenticate, async (req, res) => {
+  try {
+    const {
+      documentType,
+      type, // Alias for documentType
+      url,
+      fileUrl,
+      fileName,
+      expiresAt,
+    } = req.body;
+
+    const docType = documentType || type;
+    const docUrl = url || fileUrl;
+
+    if (!docType) {
+      return res.status(400).json({ error: 'Document type is required' });
+    }
+
+    if (!docUrl) {
+      return res.status(400).json({
+        error: 'Document URL is required',
+        hint: 'Upload the file first using /documents/upload-url endpoint, then provide the URL here'
+      });
+    }
+
+    // Upsert document record
+    const result = await pool.query(`
+      INSERT INTO driver_documents (user_id, document_type, file_url, file_name, status, expires_at, uploaded_at)
+      VALUES ($1, $2, $3, $4, 'pending', $5, NOW())
+      ON CONFLICT (user_id, document_type)
+      DO UPDATE SET
+        file_url = EXCLUDED.file_url,
+        file_name = EXCLUDED.file_name,
+        status = 'pending',
+        expires_at = EXCLUDED.expires_at,
+        uploaded_at = NOW(),
+        reviewed_at = NULL,
+        rejection_reason = NULL
+      RETURNING *
+    `, [req.user.id, docType, docUrl, fileName || null, expiresAt || null]);
+
+    const doc = result.rows[0];
+
+    // Update user's updated_at timestamp
+    // Note: approval_status is managed separately by the verification flow
+    await pool.query(`
+      UPDATE users SET updated_at = NOW() WHERE id = $1
+    `, [req.user.id]);
+
+    res.status(201).json({
+      message: 'Document uploaded successfully',
+      document: {
+        id: doc.id,
+        type: doc.document_type,
+        url: doc.file_url,
+        fileName: doc.file_name,
+        status: doc.status,
+        uploadedAt: doc.uploaded_at,
+      },
+    });
+  } catch (error) {
+    console.error('[Drivers] Upload document error:', error);
+    res.status(500).json({ error: 'Failed to upload document' });
+  }
+});
+
+/**
+ * DELETE /api/drivers/documents/:type
+ * Delete a document by type
+ */
+router.delete('/documents/:type', authenticate, async (req, res) => {
+  try {
+    const { type } = req.params;
+
+    const result = await pool.query(`
+      DELETE FROM driver_documents
+      WHERE user_id = $1 AND document_type = $2
+      RETURNING id, document_type
+    `, [req.user.id, type]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Document not found' });
+    }
+
+    // Update user's updated_at timestamp
+    await pool.query(`
+      UPDATE users SET updated_at = NOW() WHERE id = $1
+    `, [req.user.id]);
+
+    res.json({
+      message: 'Document deleted successfully',
+      deletedType: type,
+    });
+  } catch (error) {
+    console.error('[Drivers] Delete document error:', error);
+    res.status(500).json({ error: 'Failed to delete document' });
+  }
+});
+
+// ============================================
 // GET /api/drivers/earnings
 // Get driver's earnings summary
 // ============================================
@@ -607,6 +947,116 @@ router.get('/stats', authenticate, async (req, res) => {
   } catch (error) {
     console.error('[Drivers] Stats error:', error);
     res.status(500).json({ error: 'Failed to get stats' });
+  }
+});
+
+// ============================================
+// GET /api/drivers/:driverId/ratings
+// Get ratings received by a driver
+// ============================================
+
+router.get('/:driverId/ratings', authenticate, async (req, res) => {
+  try {
+    const { driverId } = req.params;
+    const { limit = 20, offset = 0 } = req.query;
+
+    // Get driver info with rating
+    const driverResult = await pool.query(`
+      SELECT
+        id,
+        first_name,
+        last_name,
+        profile_picture_url,
+        rating,
+        rating_count,
+        vehicle_type
+      FROM users
+      WHERE id = $1 AND role = 'driver'
+    `, [driverId]);
+
+    if (driverResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Driver not found' });
+    }
+
+    const driver = driverResult.rows[0];
+
+    // Get ratings received by this driver
+    const ratingsResult = await pool.query(`
+      SELECT
+        dr.id,
+        dr.rating,
+        dr.comment,
+        dr.tags,
+        dr.created_at,
+        l.id as load_id,
+        l.pickup_city,
+        l.pickup_state,
+        l.delivery_city,
+        l.delivery_state,
+        l.delivered_at,
+        u.company_name as shipper_name,
+        u.first_name as shipper_first_name
+      FROM driver_ratings dr
+      JOIN loads l ON dr.load_id = l.id
+      LEFT JOIN users u ON dr.shipper_id = u.id
+      WHERE dr.driver_id = $1
+      ORDER BY dr.created_at DESC
+      LIMIT $2 OFFSET $3
+    `, [driverId, parseInt(limit), parseInt(offset)]);
+
+    // Get rating distribution
+    const distributionResult = await pool.query(`
+      SELECT
+        rating,
+        COUNT(*) as count
+      FROM driver_ratings
+      WHERE driver_id = $1
+      GROUP BY rating
+      ORDER BY rating DESC
+    `, [driverId]);
+
+    // Build distribution object (5, 4, 3, 2, 1 stars)
+    const distribution = { 5: 0, 4: 0, 3: 0, 2: 0, 1: 0 };
+    distributionResult.rows.forEach(row => {
+      distribution[row.rating] = parseInt(row.count);
+    });
+
+    // Get total count for pagination
+    const countResult = await pool.query(
+      'SELECT COUNT(*) as total FROM driver_ratings WHERE driver_id = $1',
+      [driverId]
+    );
+
+    res.json({
+      driver: {
+        id: driver.id,
+        name: `${driver.first_name} ${driver.last_name || ''}`.trim(),
+        profilePictureUrl: driver.profile_picture_url,
+        rating: parseFloat(driver.rating) || 0,
+        ratingCount: parseInt(driver.rating_count) || 0,
+        vehicleType: driver.vehicle_type,
+      },
+      ratings: ratingsResult.rows.map(r => ({
+        id: r.id,
+        rating: r.rating,
+        comment: r.comment,
+        tags: r.tags,
+        createdAt: r.created_at,
+        loadId: r.load_id,
+        route: `${r.pickup_city}, ${r.pickup_state} → ${r.delivery_city}, ${r.delivery_state}`,
+        deliveredAt: r.delivered_at,
+        shipperName: r.shipper_name || r.shipper_first_name || 'Anonymous',
+      })),
+      distribution,
+      pagination: {
+        total: parseInt(countResult.rows[0].total),
+        limit: parseInt(limit),
+        offset: parseInt(offset),
+      },
+    });
+  } catch (error) {
+    console.error('[Drivers] Get ratings error:', error);
+    res.status(500).json({ error: 'Failed to fetch driver ratings' });
   }
 });
 

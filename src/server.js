@@ -6,6 +6,7 @@ const config = require('./config');
 const { pool } = require('./db/pool');
 const { connectRedis } = require('./db/redis');
 const { initializeSocket } = require('./realtime/socket');
+const { runMigrationsV2 } = require('./db/migrations_v2');
 
 // Routes registered in app.js, just add tracking if not there
 const trackingRoutes = require('./routes/tracking');
@@ -17,7 +18,12 @@ async function startServer() {
     console.log('[Server] Testing database connection...');
     await pool.query('SELECT 1');
     console.log('[Server] Database connected');
-    
+
+    // Run database migrations
+    console.log('[Server] Running database migrations...');
+    await runMigrationsV2();
+    console.log('[Server] Migrations complete');
+
     // Connect to Redis
     console.log('[Server] Connecting to Redis...');
     await connectRedis();

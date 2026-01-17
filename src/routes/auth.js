@@ -722,4 +722,304 @@ router.get('/plans', async (req, res) => {
   }
 });
 
+// ============================================
+// PASSWORD RESET FLOW
+// ============================================
+
+/**
+ * Helper: Generate 6-digit reset code
+ */
+const generateResetCode = () => {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+};
+
+/**
+ * POST /auth/forgot-password
+ * Send password reset code to email
+ */
+router.post('/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+
+    // Find user
+    const userResult = await pool.query(
+      'SELECT id, email, first_name FROM users WHERE email = $1 AND is_active = true',
+      [email.toLowerCase()]
+    );
+
+    // Always return success to prevent email enumeration
+    if (userResult.rows.length === 0) {
+      return res.json({
+        message: 'If an account exists with this email, a reset code has been sent.',
+        codeSent: true
+      });
+    }
+
+    const user = userResult.rows[0];
+
+    // Generate 6-digit code
+    const resetCode = generateResetCode();
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+
+    // Delete any existing reset codes for this user
+    await pool.query(
+      'DELETE FROM password_reset_codes WHERE user_id = $1',
+      [user.id]
+    );
+
+    // Store reset code
+    await pool.query(
+      `INSERT INTO password_reset_codes (user_id, code, expires_at)
+       VALUES ($1, $2, $3)`,
+      [user.id, resetCode, expiresAt]
+    );
+
+    // TODO: Send email with reset code
+    // await sendResetCodeEmail(user.email, user.first_name, resetCode);
+    console.log(`[Auth] Password reset code for ${user.email}: ${resetCode}`);
+
+    res.json({
+      message: 'If an account exists with this email, a reset code has been sent.',
+      codeSent: true,
+      // Include code in dev environment only (remove in production)
+      ...(process.env.NODE_ENV === 'development' && { devCode: resetCode })
+    });
+  } catch (error) {
+    console.error('[Auth] Forgot password error:', error);
+    res.status(500).json({ error: 'Failed to process request' });
+  }
+});
+
+/**
+ * POST /auth/verify-reset-code
+ * Verify the reset code is valid
+ */
+router.post('/verify-reset-code', async (req, res) => {
+  try {
+    const { email, code } = req.body;
+
+    if (!email || !code) {
+      return res.status(400).json({ error: 'Email and code are required' });
+    }
+
+    // Find user and valid reset code
+    const result = await pool.query(
+      `SELECT prc.id, prc.user_id, prc.attempts, u.email
+       FROM password_reset_codes prc
+       JOIN users u ON prc.user_id = u.id
+       WHERE u.email = $1
+         AND prc.code = $2
+         AND prc.expires_at > NOW()
+         AND prc.used_at IS NULL`,
+      [email.toLowerCase(), code]
+    );
+
+    if (result.rows.length === 0) {
+      // Increment attempts if code exists but is wrong
+      await pool.query(
+        `UPDATE password_reset_codes prc
+         SET attempts = attempts + 1
+         FROM users u
+         WHERE prc.user_id = u.id AND u.email = $1 AND prc.expires_at > NOW()`,
+        [email.toLowerCase()]
+      );
+
+      return res.status(400).json({
+        error: 'Invalid or expired code',
+        valid: false
+      });
+    }
+
+    const resetRecord = result.rows[0];
+
+    // Check if too many attempts
+    if (resetRecord.attempts >= 5) {
+      return res.status(429).json({
+        error: 'Too many attempts. Please request a new code.',
+        valid: false
+      });
+    }
+
+    // Generate a temporary token for the reset step
+    const resetToken = crypto.randomBytes(32).toString('hex');
+
+    // Update record with token
+    await pool.query(
+      `UPDATE password_reset_codes
+       SET reset_token = $1, verified_at = NOW()
+       WHERE id = $2`,
+      [resetToken, resetRecord.id]
+    );
+
+    res.json({
+      message: 'Code verified successfully',
+      valid: true,
+      resetToken
+    });
+  } catch (error) {
+    console.error('[Auth] Verify reset code error:', error);
+    res.status(500).json({ error: 'Failed to verify code' });
+  }
+});
+
+/**
+ * POST /auth/reset-password
+ * Reset password using verified reset token
+ */
+router.post('/reset-password', async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { email, code, resetToken, newPassword } = req.body;
+
+    if (!newPassword) {
+      return res.status(400).json({ error: 'New password is required' });
+    }
+
+    if (newPassword.length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    }
+
+    // Verify the reset - accept either code or resetToken
+    let query, params;
+
+    if (resetToken) {
+      // Using the token from verify-reset-code step
+      query = `
+        SELECT prc.id, prc.user_id
+        FROM password_reset_codes prc
+        JOIN users u ON prc.user_id = u.id
+        WHERE prc.reset_token = $1
+          AND prc.expires_at > NOW()
+          AND prc.used_at IS NULL
+          AND prc.verified_at IS NOT NULL`;
+      params = [resetToken];
+    } else if (email && code) {
+      // Direct reset with email + code (for apps that skip verify step)
+      query = `
+        SELECT prc.id, prc.user_id
+        FROM password_reset_codes prc
+        JOIN users u ON prc.user_id = u.id
+        WHERE u.email = $1
+          AND prc.code = $2
+          AND prc.expires_at > NOW()
+          AND prc.used_at IS NULL`;
+      params = [email.toLowerCase(), code];
+    } else {
+      return res.status(400).json({
+        error: 'Either resetToken or email+code is required'
+      });
+    }
+
+    const result = await pool.query(query, params);
+
+    if (result.rows.length === 0) {
+      return res.status(400).json({ error: 'Invalid or expired reset request' });
+    }
+
+    const resetRecord = result.rows[0];
+
+    await client.query('BEGIN');
+
+    // Hash new password
+    const passwordHash = await bcrypt.hash(newPassword, 12);
+
+    // Update user password
+    await client.query(
+      `UPDATE users
+       SET password_hash = $1, updated_at = NOW()
+       WHERE id = $2`,
+      [passwordHash, resetRecord.user_id]
+    );
+
+    // Mark reset code as used
+    await client.query(
+      `UPDATE password_reset_codes
+       SET used_at = NOW()
+       WHERE id = $1`,
+      [resetRecord.id]
+    );
+
+    // Invalidate all other reset codes for this user
+    await client.query(
+      `DELETE FROM password_reset_codes
+       WHERE user_id = $1 AND id != $2`,
+      [resetRecord.user_id, resetRecord.id]
+    );
+
+    await client.query('COMMIT');
+
+    // TODO: Send password changed confirmation email
+    // await sendPasswordChangedEmail(user.email);
+
+    res.json({
+      message: 'Password reset successfully',
+      success: true
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('[Auth] Reset password error:', error);
+    res.status(500).json({ error: 'Failed to reset password' });
+  } finally {
+    client.release();
+  }
+});
+
+/**
+ * POST /auth/change-password
+ * Change password for authenticated user (legacy support for driver app)
+ */
+router.post('/change-password', authenticate, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ error: 'Current password and new password are required' });
+    }
+
+    if (newPassword.length < 8) {
+      return res.status(400).json({ error: 'New password must be at least 8 characters' });
+    }
+
+    // Get current password hash
+    const userResult = await pool.query(
+      'SELECT password_hash FROM users WHERE id = $1',
+      [req.user.id]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Verify current password
+    const valid = await bcrypt.compare(currentPassword, userResult.rows[0].password_hash);
+    if (!valid) {
+      return res.status(401).json({ error: 'Current password is incorrect' });
+    }
+
+    // Hash new password
+    const passwordHash = await bcrypt.hash(newPassword, 12);
+
+    // Update password
+    await pool.query(
+      `UPDATE users
+       SET password_hash = $1, updated_at = NOW()
+       WHERE id = $2`,
+      [passwordHash, req.user.id]
+    );
+
+    res.json({
+      message: 'Password changed successfully',
+      success: true
+    });
+  } catch (error) {
+    console.error('[Auth] Change password error:', error);
+    res.status(500).json({ error: 'Failed to change password' });
+  }
+});
+
 module.exports = router;

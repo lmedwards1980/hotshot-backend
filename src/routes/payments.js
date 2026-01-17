@@ -663,4 +663,504 @@ router.get('/earnings', authenticate, requireUserType('driver'), async (req, res
   }
 });
 
+// ============================================
+// PAYOUT SETTINGS (Driver)
+// ============================================
+
+/**
+ * GET /payments/payout-settings
+ * Get driver's payout settings
+ */
+router.get('/payout-settings', authenticate, async (req, res) => {
+  try {
+    const userResult = await pool.query(`
+      SELECT
+        stripe_account_id,
+        payout_schedule,
+        instant_payout_enabled,
+        default_payout_method
+      FROM users
+      WHERE id = $1
+    `, [req.user.id]);
+
+    if (!userResult.rows[0]?.stripe_account_id) {
+      return res.json({
+        connected: false,
+        payoutSchedule: 'manual',
+        instantPayoutEnabled: false,
+        defaultPayoutMethod: null,
+        bankAccounts: [],
+        cards: [],
+      });
+    }
+
+    const user = userResult.rows[0];
+
+    // Get external accounts from Stripe
+    let bankAccounts = [];
+    let cards = [];
+
+    try {
+      const account = await stripeService.stripe.accounts.retrieve(user.stripe_account_id, {
+        expand: ['external_accounts']
+      });
+
+      if (account.external_accounts?.data) {
+        bankAccounts = account.external_accounts.data
+          .filter(a => a.object === 'bank_account')
+          .map(a => ({
+            id: a.id,
+            bankName: a.bank_name,
+            last4: a.last4,
+            routingNumber: a.routing_number,
+            isDefault: a.default_for_currency,
+            status: a.status,
+          }));
+
+        cards = account.external_accounts.data
+          .filter(a => a.object === 'card')
+          .map(a => ({
+            id: a.id,
+            brand: a.brand,
+            last4: a.last4,
+            expMonth: a.exp_month,
+            expYear: a.exp_year,
+            isDefault: a.default_for_currency,
+          }));
+      }
+    } catch (stripeError) {
+      console.error('[Payments] Failed to get external accounts:', stripeError.message);
+    }
+
+    res.json({
+      connected: true,
+      payoutSchedule: user.payout_schedule || 'daily',
+      instantPayoutEnabled: user.instant_payout_enabled || false,
+      defaultPayoutMethod: user.default_payout_method,
+      bankAccounts,
+      cards,
+    });
+  } catch (error) {
+    console.error('[Payments] Get payout settings error:', error);
+    res.status(500).json({ error: 'Failed to get payout settings' });
+  }
+});
+
+/**
+ * PUT /payments/payout-settings
+ * Update driver's payout settings
+ */
+router.put('/payout-settings', authenticate, async (req, res) => {
+  try {
+    const { payoutSchedule, instantPayoutEnabled, defaultPayoutMethod } = req.body;
+
+    const userResult = await pool.query(
+      'SELECT stripe_account_id FROM users WHERE id = $1',
+      [req.user.id]
+    );
+
+    if (!userResult.rows[0]?.stripe_account_id) {
+      return res.status(400).json({ error: 'Stripe account not set up' });
+    }
+
+    const accountId = userResult.rows[0].stripe_account_id;
+
+    // Update Stripe payout schedule if changed
+    if (payoutSchedule) {
+      const validSchedules = ['manual', 'daily', 'weekly', 'monthly'];
+      if (!validSchedules.includes(payoutSchedule)) {
+        return res.status(400).json({ error: 'Invalid payout schedule' });
+      }
+
+      try {
+        let stripeSchedule = {};
+        if (payoutSchedule === 'manual') {
+          stripeSchedule = { interval: 'manual' };
+        } else if (payoutSchedule === 'daily') {
+          stripeSchedule = { interval: 'daily' };
+        } else if (payoutSchedule === 'weekly') {
+          stripeSchedule = { interval: 'weekly', weekly_anchor: 'friday' };
+        } else if (payoutSchedule === 'monthly') {
+          stripeSchedule = { interval: 'monthly', monthly_anchor: 1 };
+        }
+
+        await stripeService.stripe.accounts.update(accountId, {
+          settings: {
+            payouts: {
+              schedule: stripeSchedule
+            }
+          }
+        });
+      } catch (stripeError) {
+        console.error('[Payments] Failed to update Stripe schedule:', stripeError.message);
+        // Continue with local update even if Stripe fails
+      }
+    }
+
+    // Update default payout method in Stripe if changed
+    if (defaultPayoutMethod) {
+      try {
+        await stripeService.stripe.accounts.update(accountId, {
+          default_currency: 'usd',
+        });
+        // Set the default external account
+        await stripeService.stripe.accounts.updateExternalAccount(
+          accountId,
+          defaultPayoutMethod,
+          { default_for_currency: true }
+        );
+      } catch (stripeError) {
+        console.error('[Payments] Failed to update default method:', stripeError.message);
+      }
+    }
+
+    // Update local database
+    const updates = [];
+    const values = [];
+    let paramCount = 0;
+
+    if (payoutSchedule !== undefined) {
+      paramCount++;
+      updates.push(`payout_schedule = $${paramCount}`);
+      values.push(payoutSchedule);
+    }
+
+    if (instantPayoutEnabled !== undefined) {
+      paramCount++;
+      updates.push(`instant_payout_enabled = $${paramCount}`);
+      values.push(instantPayoutEnabled);
+    }
+
+    if (defaultPayoutMethod !== undefined) {
+      paramCount++;
+      updates.push(`default_payout_method = $${paramCount}`);
+      values.push(defaultPayoutMethod);
+    }
+
+    if (updates.length > 0) {
+      paramCount++;
+      values.push(req.user.id);
+      await pool.query(
+        `UPDATE users SET ${updates.join(', ')}, updated_at = NOW() WHERE id = $${paramCount}`,
+        values
+      );
+    }
+
+    res.json({
+      message: 'Payout settings updated',
+      payoutSchedule,
+      instantPayoutEnabled,
+      defaultPayoutMethod,
+    });
+  } catch (error) {
+    console.error('[Payments] Update payout settings error:', error);
+    res.status(500).json({ error: 'Failed to update payout settings' });
+  }
+});
+
+/**
+ * POST /payments/instant-payout
+ * Request instant payout (simplified endpoint for driver app)
+ */
+router.post('/instant-payout', authenticate, async (req, res) => {
+  try {
+    const { amount } = req.body;
+
+    if (!amount || amount <= 0) {
+      return res.status(400).json({ error: 'Valid amount is required' });
+    }
+
+    const userResult = await pool.query(
+      'SELECT stripe_account_id, instant_payout_enabled FROM users WHERE id = $1',
+      [req.user.id]
+    );
+
+    if (!userResult.rows[0]?.stripe_account_id) {
+      return res.status(400).json({ error: 'Stripe account not set up' });
+    }
+
+    const user = userResult.rows[0];
+
+    // Check balance
+    const balance = await stripeService.getDriverBalance(user.stripe_account_id);
+
+    if (balance.available < amount) {
+      return res.status(400).json({
+        error: 'Insufficient balance',
+        available: balance.available,
+        requested: amount,
+      });
+    }
+
+    // Create instant payout
+    const payout = await stripeService.createInstantPayout(
+      user.stripe_account_id,
+      amount
+    );
+
+    // Record payout in database
+    await pool.query(`
+      INSERT INTO payout_history (user_id, amount, type, status, stripe_payout_id)
+      VALUES ($1, $2, 'instant', $3, $4)
+    `, [req.user.id, amount, payout.status, payout.id]);
+
+    res.json({
+      success: true,
+      payoutId: payout.id,
+      amount: payout.amount / 100,
+      status: payout.status,
+      arrivalDate: payout.arrival_date,
+      fee: payout.fee ? payout.fee / 100 : 0,
+    });
+  } catch (error) {
+    console.error('[Payments] Instant payout error:', error);
+    res.status(500).json({ error: error.message || 'Failed to create instant payout' });
+  }
+});
+
+// ============================================
+// BANK ACCOUNTS & CARDS (Driver Payout Methods)
+// ============================================
+
+/**
+ * POST /payments/bank-accounts
+ * Add bank account for driver payouts
+ */
+router.post('/bank-accounts', authenticate, async (req, res) => {
+  try {
+    const {
+      accountHolderName,
+      routingNumber,
+      accountNumber,
+      accountHolderType = 'individual', // 'individual' or 'company'
+    } = req.body;
+
+    // Validate required fields
+    if (!accountHolderName || !routingNumber || !accountNumber) {
+      return res.status(400).json({
+        error: 'Account holder name, routing number, and account number are required'
+      });
+    }
+
+    // Validate routing number format (9 digits)
+    if (!/^\d{9}$/.test(routingNumber)) {
+      return res.status(400).json({ error: 'Invalid routing number format' });
+    }
+
+    // Get user's Stripe account
+    const userResult = await pool.query(
+      'SELECT stripe_account_id FROM users WHERE id = $1',
+      [req.user.id]
+    );
+
+    if (!userResult.rows[0]?.stripe_account_id) {
+      return res.status(400).json({ error: 'Stripe account not set up. Please complete onboarding first.' });
+    }
+
+    const accountId = userResult.rows[0].stripe_account_id;
+
+    // Create bank account token
+    const token = await stripeService.stripe.tokens.create({
+      bank_account: {
+        country: 'US',
+        currency: 'usd',
+        account_holder_name: accountHolderName,
+        account_holder_type: accountHolderType,
+        routing_number: routingNumber,
+        account_number: accountNumber,
+      },
+    });
+
+    // Add bank account to Connect account
+    const bankAccount = await stripeService.stripe.accounts.createExternalAccount(
+      accountId,
+      { external_account: token.id }
+    );
+
+    res.status(201).json({
+      message: 'Bank account added successfully',
+      bankAccount: {
+        id: bankAccount.id,
+        bankName: bankAccount.bank_name,
+        last4: bankAccount.last4,
+        routingNumber: bankAccount.routing_number,
+        isDefault: bankAccount.default_for_currency,
+        status: bankAccount.status,
+      },
+    });
+  } catch (error) {
+    console.error('[Payments] Add bank account error:', error);
+
+    // Handle specific Stripe errors
+    if (error.type === 'StripeInvalidRequestError') {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.status(500).json({ error: 'Failed to add bank account' });
+  }
+});
+
+/**
+ * POST /payments/cards
+ * Add debit card for driver instant payouts
+ */
+router.post('/cards', authenticate, async (req, res) => {
+  try {
+    const {
+      cardNumber,
+      expMonth,
+      expYear,
+      cvc,
+      cardholderName,
+    } = req.body;
+
+    // Validate required fields
+    if (!cardNumber || !expMonth || !expYear || !cvc) {
+      return res.status(400).json({
+        error: 'Card number, expiration date, and CVC are required'
+      });
+    }
+
+    // Get user's Stripe account
+    const userResult = await pool.query(
+      'SELECT stripe_account_id FROM users WHERE id = $1',
+      [req.user.id]
+    );
+
+    if (!userResult.rows[0]?.stripe_account_id) {
+      return res.status(400).json({ error: 'Stripe account not set up. Please complete onboarding first.' });
+    }
+
+    const accountId = userResult.rows[0].stripe_account_id;
+
+    // Create card token
+    // Note: In production, card details should be tokenized client-side using Stripe.js
+    const token = await stripeService.stripe.tokens.create({
+      card: {
+        number: cardNumber.replace(/\s/g, ''),
+        exp_month: parseInt(expMonth),
+        exp_year: parseInt(expYear),
+        cvc: cvc,
+        name: cardholderName,
+        currency: 'usd',
+      },
+    });
+
+    // Add card to Connect account as external account (for payouts)
+    const card = await stripeService.stripe.accounts.createExternalAccount(
+      accountId,
+      { external_account: token.id }
+    );
+
+    // Enable instant payouts for this user
+    await pool.query(
+      'UPDATE users SET instant_payout_enabled = true WHERE id = $1',
+      [req.user.id]
+    );
+
+    res.status(201).json({
+      message: 'Debit card added successfully',
+      card: {
+        id: card.id,
+        brand: card.brand,
+        last4: card.last4,
+        expMonth: card.exp_month,
+        expYear: card.exp_year,
+        isDefault: card.default_for_currency,
+      },
+      instantPayoutEnabled: true,
+    });
+  } catch (error) {
+    console.error('[Payments] Add card error:', error);
+
+    // Handle specific Stripe errors
+    if (error.type === 'StripeCardError') {
+      return res.status(400).json({ error: error.message });
+    }
+    if (error.type === 'StripeInvalidRequestError') {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.status(500).json({ error: 'Failed to add debit card' });
+  }
+});
+
+/**
+ * DELETE /payments/bank-accounts/:id
+ * Remove a bank account
+ */
+router.delete('/bank-accounts/:id', authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const userResult = await pool.query(
+      'SELECT stripe_account_id FROM users WHERE id = $1',
+      [req.user.id]
+    );
+
+    if (!userResult.rows[0]?.stripe_account_id) {
+      return res.status(400).json({ error: 'Stripe account not set up' });
+    }
+
+    await stripeService.stripe.accounts.deleteExternalAccount(
+      userResult.rows[0].stripe_account_id,
+      id
+    );
+
+    res.json({ message: 'Bank account removed successfully' });
+  } catch (error) {
+    console.error('[Payments] Delete bank account error:', error);
+    res.status(500).json({ error: 'Failed to remove bank account' });
+  }
+});
+
+/**
+ * DELETE /payments/cards/:id
+ * Remove a debit card
+ */
+router.delete('/cards/:id', authenticate, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const userResult = await pool.query(
+      'SELECT stripe_account_id FROM users WHERE id = $1',
+      [req.user.id]
+    );
+
+    if (!userResult.rows[0]?.stripe_account_id) {
+      return res.status(400).json({ error: 'Stripe account not set up' });
+    }
+
+    await stripeService.stripe.accounts.deleteExternalAccount(
+      userResult.rows[0].stripe_account_id,
+      id
+    );
+
+    // Check if any debit cards remain for instant payouts
+    const account = await stripeService.stripe.accounts.retrieve(
+      userResult.rows[0].stripe_account_id,
+      { expand: ['external_accounts'] }
+    );
+
+    const hasDebitCard = account.external_accounts?.data?.some(
+      a => a.object === 'card'
+    );
+
+    if (!hasDebitCard) {
+      await pool.query(
+        'UPDATE users SET instant_payout_enabled = false WHERE id = $1',
+        [req.user.id]
+      );
+    }
+
+    res.json({
+      message: 'Card removed successfully',
+      instantPayoutEnabled: hasDebitCard,
+    });
+  } catch (error) {
+    console.error('[Payments] Delete card error:', error);
+    res.status(500).json({ error: 'Failed to remove card' });
+  }
+});
+
 module.exports = router;
