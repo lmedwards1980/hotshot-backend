@@ -50,10 +50,10 @@ router.post('/confirm-upload', authenticate, requireUserType('driver'), async (r
     
     // Store document reference in database
     await pool.query(`
-      INSERT INTO driver_documents (driver_id, document_type, s3_key, status, uploaded_at)
-      VALUES ($1, $2, $3, 'pending_review', NOW())
-      ON CONFLICT (driver_id, document_type) 
-      DO UPDATE SET s3_key = $3, status = 'pending_review', uploaded_at = NOW()
+      INSERT INTO driver_documents (user_id, document_type, s3_key, status, uploaded_at)
+      VALUES ($1, $2, $3, 'pending', NOW())
+      ON CONFLICT (user_id, document_type)
+      DO UPDATE SET s3_key = $3, status = 'pending', uploaded_at = NOW()
     `, [req.user.id, documentType, s3Key]);
     
     // Check if all required documents are uploaded
@@ -96,8 +96,8 @@ router.get('/view/:documentType', authenticate, async (req, res) => {
     
     // Get S3 key from database
     const result = await pool.query(
-      `SELECT s3_key FROM driver_documents 
-       WHERE driver_id = $1 AND document_type = $2`,
+      `SELECT s3_key FROM driver_documents
+       WHERE user_id = $1 AND document_type = $2`,
       [req.user.id, documentType]
     );
     
@@ -120,8 +120,8 @@ router.delete('/:documentType', authenticate, requireUserType('driver'), async (
     
     // Get S3 key
     const result = await pool.query(
-      `SELECT s3_key FROM driver_documents 
-       WHERE driver_id = $1 AND document_type = $2`,
+      `SELECT s3_key FROM driver_documents
+       WHERE user_id = $1 AND document_type = $2`,
       [req.user.id, documentType]
     );
     
@@ -134,7 +134,7 @@ router.delete('/:documentType', authenticate, requireUserType('driver'), async (
     
     // Delete from database
     await pool.query(
-      `DELETE FROM driver_documents WHERE driver_id = $1 AND document_type = $2`,
+      `DELETE FROM driver_documents WHERE user_id = $1 AND document_type = $2`,
       [req.user.id, documentType]
     );
     

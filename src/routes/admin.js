@@ -162,15 +162,16 @@ router.get('/users/:id', async (req, res) => {
         createdAt: user.created_at,
       },
       driverProfile: user.user_type === 'driver' ? {
-        cdlNumber: user.cdl_number,
-        cdlState: user.cdl_state,
-        cdlExpiry: user.cdl_expiry,
+        licenseNumber: user.license_number,
+        licenseState: user.license_state,
+        licenseExpiry: user.license_expiry,
         mcNumber: user.mc_number,
         dotNumber: user.dot_number,
-        truckType: user.truck_type,
-        maxWeight: user.max_weight_lbs,
+        vehicleType: user.vehicle_type,
+        vehicleMake: user.vehicle_make,
+        vehicleModel: user.vehicle_model,
         verificationStatus: user.verification_status,
-        verifiedAt: user.verified_at,
+        isVerified: user.is_verified,
       } : null,
       documents,
       recentLoads: loadsResult.rows,
@@ -223,11 +224,11 @@ router.patch('/users/:id', async (req, res) => {
 router.get('/verification/pending', async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT u.id, u.name, u.email, u.phone, u.created_at,
-             dp.verification_status, dp.cdl_number, dp.cdl_state, dp.truck_type
+      SELECT u.id, u.first_name, u.last_name, u.email, u.phone, u.created_at,
+             dp.license_number, dp.license_state, dp.vehicle_type, u.is_verified
       FROM users u
       JOIN driver_profiles dp ON u.id = dp.user_id
-      WHERE dp.verification_status IN ('pending', 'documents_submitted', 'background_check_pending')
+      WHERE u.is_verified = false AND u.role = 'driver'
       ORDER BY u.created_at ASC
     `);
     
@@ -236,13 +237,13 @@ router.get('/verification/pending', async (req, res) => {
       const docStatus = await documentService.getDriverDocumentStatus(pool, row.id);
       drivers.push({
         id: row.id,
-        name: row.name,
+        name: `${row.first_name || ''} ${row.last_name || ''}`.trim() || 'Unknown',
         email: row.email,
         phone: row.phone,
-        verificationStatus: row.verification_status,
-        cdlNumber: row.cdl_number,
-        cdlState: row.cdl_state,
-        truckType: row.truck_type,
+        isVerified: row.is_verified,
+        licenseNumber: row.license_number,
+        licenseState: row.license_state,
+        vehicleType: row.vehicle_type,
         documentsComplete: docStatus.complete,
         documentsProgress: docStatus.progress,
         createdAt: row.created_at,

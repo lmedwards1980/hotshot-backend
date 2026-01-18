@@ -51,8 +51,8 @@ router.post('/submit', authenticate, requireUserType('driver'), async (req, res)
     
     // Check documents are complete
     const docStatus = await pool.query(
-      `SELECT document_type FROM driver_documents 
-       WHERE driver_id = $1 AND status != 'rejected'`,
+      `SELECT document_type FROM driver_documents
+       WHERE user_id = $1 AND status != 'rejected'`,
       [req.user.id]
     );
     
@@ -81,8 +81,8 @@ router.post('/submit', authenticate, requireUserType('driver'), async (req, res)
       phone: userResult.rows[0].phone,
       dateOfBirth, // YYYY-MM-DD
       ssn: ssnLast4,
-      cdlNumber: profile.cdl_number,
-      cdlState: profile.cdl_state,
+      cdlNumber: profile.license_number,
+      cdlState: profile.license_state,
     });
     
     if (!candidateResult.success) {
@@ -121,28 +121,29 @@ router.post('/submit', authenticate, requireUserType('driver'), async (req, res)
 // Update driver profile info
 router.patch('/profile', authenticate, requireUserType('driver'), async (req, res) => {
   try {
-    const { 
+    const {
       cdlNumber, cdlState, cdlExpiry,
       mcNumber, dotNumber,
-      insuranceProvider, insurancePolicyNumber, insuranceExpiry,
-      truckType, maxWeightLbs, trailerLengthFt
+      insurancePolicyNumber, insuranceExpiry,
+      vehicleType, vehicleMake, vehicleModel, vehicleYear, vehiclePlate
     } = req.body;
-    
+
     const updates = [];
     const params = [req.user.id];
     let paramIndex = 2;
-    
-    if (cdlNumber) { updates.push(`cdl_number = $${paramIndex++}`); params.push(cdlNumber); }
-    if (cdlState) { updates.push(`cdl_state = $${paramIndex++}`); params.push(cdlState); }
-    if (cdlExpiry) { updates.push(`cdl_expiry = $${paramIndex++}`); params.push(cdlExpiry); }
+
+    if (cdlNumber) { updates.push(`license_number = $${paramIndex++}`); params.push(cdlNumber); }
+    if (cdlState) { updates.push(`license_state = $${paramIndex++}`); params.push(cdlState); }
+    if (cdlExpiry) { updates.push(`license_expiry = $${paramIndex++}`); params.push(cdlExpiry); }
     if (mcNumber) { updates.push(`mc_number = $${paramIndex++}`); params.push(mcNumber); }
     if (dotNumber) { updates.push(`dot_number = $${paramIndex++}`); params.push(dotNumber); }
-    if (insuranceProvider) { updates.push(`insurance_provider = $${paramIndex++}`); params.push(insuranceProvider); }
-    if (insurancePolicyNumber) { updates.push(`insurance_policy_number = $${paramIndex++}`); params.push(insurancePolicyNumber); }
+    if (insurancePolicyNumber) { updates.push(`insurance_policy = $${paramIndex++}`); params.push(insurancePolicyNumber); }
     if (insuranceExpiry) { updates.push(`insurance_expiry = $${paramIndex++}`); params.push(insuranceExpiry); }
-    if (truckType) { updates.push(`truck_type = $${paramIndex++}`); params.push(truckType); }
-    if (maxWeightLbs) { updates.push(`max_weight_lbs = $${paramIndex++}`); params.push(maxWeightLbs); }
-    if (trailerLengthFt) { updates.push(`trailer_length_ft = $${paramIndex++}`); params.push(trailerLengthFt); }
+    if (vehicleType) { updates.push(`vehicle_type = $${paramIndex++}`); params.push(vehicleType); }
+    if (vehicleMake) { updates.push(`vehicle_make = $${paramIndex++}`); params.push(vehicleMake); }
+    if (vehicleModel) { updates.push(`vehicle_model = $${paramIndex++}`); params.push(vehicleModel); }
+    if (vehicleYear) { updates.push(`vehicle_year = $${paramIndex++}`); params.push(vehicleYear); }
+    if (vehiclePlate) { updates.push(`vehicle_plate = $${paramIndex++}`); params.push(vehiclePlate); }
     
     if (updates.length === 0) {
       return res.status(400).json({ error: 'No updates provided' });
