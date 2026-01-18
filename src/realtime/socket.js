@@ -82,8 +82,8 @@ const initializeSocket = (server) => {
           
           // Broadcast to shipper if driver has active load
           const activeLoad = await pool.query(
-            `SELECT shipper_id FROM loads 
-             WHERE driver_id = $1 AND status IN ('accepted', 'en_route_pickup', 'picked_up', 'in_transit')`,
+            `SELECT shipper_id FROM loads
+             WHERE driver_id = $1 AND status IN ('confirmed', 'en_route_pickup', 'picked_up', 'en_route_delivery')`,
             [socket.user.id]
           );
           

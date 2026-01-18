@@ -478,7 +478,7 @@ router.get('/drivers/:driverId/active-load',
           l.price, l.driver_payout, l.dispatcher_commission
         FROM loads l
         WHERE l.driver_id = $1
-          AND l.status IN ('assigned', 'accepted', 'en_route_pickup', 'at_pickup', 'picked_up', 'en_route_delivery', 'at_delivery')
+          AND l.status IN ('assigned', 'confirmed', 'en_route_pickup', 'at_pickup', 'picked_up', 'en_route_delivery', 'at_delivery')
         ORDER BY l.assigned_at DESC
         LIMIT 1
       `, [driverId]);
@@ -849,7 +849,7 @@ router.get('/drivers/:driverId/availability',
           l.delivery_date, l.delivery_time_end
         FROM loads l
         WHERE l.driver_id = $1
-          AND l.status IN ('assigned', 'accepted', 'en_route_pickup', 'at_pickup', 'picked_up', 'en_route_delivery', 'at_delivery')
+          AND l.status IN ('assigned', 'confirmed', 'en_route_pickup', 'at_pickup', 'picked_up', 'en_route_delivery', 'at_delivery')
           AND (
             -- Check for time overlap with 2 hour buffer
             (l.delivery_date + l.delivery_time_end::TIME + INTERVAL '2 hours') > ($2::DATE + $3::TIME)
@@ -915,7 +915,7 @@ router.post('/loads/:loadId/assign',
         SELECT id, delivery_city, delivery_time_end
         FROM loads
         WHERE driver_id = $1
-          AND status IN ('assigned', 'accepted', 'en_route_pickup', 'at_pickup', 'picked_up', 'en_route_delivery', 'at_delivery')
+          AND status IN ('assigned', 'confirmed', 'en_route_pickup', 'at_pickup', 'picked_up', 'en_route_delivery', 'at_delivery')
           AND (delivery_date + delivery_time_end::TIME + INTERVAL '2 hours') > ($2::DATE + $3::TIME)
         LIMIT 1
       `, [driverId, loadData.pickup_date, loadData.pickup_time_start || '00:00']);

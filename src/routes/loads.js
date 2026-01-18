@@ -785,8 +785,8 @@ router.get('/active', authenticate, async (req, res) => {
        FROM loads l
        JOIN users shipper ON l.shipper_id = shipper.id
        LEFT JOIN orgs o ON l.posted_by_org_id = o.id
-       WHERE l.driver_id = $1 
-         AND l.status IN ('assigned', 'accepted', 'en_route_pickup', 'at_pickup', 'picked_up', 'en_route_delivery', 'at_delivery')
+       WHERE l.driver_id = $1
+         AND l.status IN ('assigned', 'confirmed', 'en_route_pickup', 'at_pickup', 'picked_up', 'en_route_delivery', 'at_delivery')
        ORDER BY l.assigned_at DESC
        LIMIT 1`,
       [req.user.id]
