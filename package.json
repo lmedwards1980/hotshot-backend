@@ -1,0 +1,43 @@
+{
+  "name": "hotshot-backend-api",
+  "version": "1.0.0",
+  "description": "Hotshot Platform Backend API",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.965.0",
+    "@aws-sdk/s3-request-presigner": "^3.966.0",
+    "@sendgrid/mail": "^8.1.0",
+    "axios": "^1.6.5",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "expo-camera": "~16.0.18",
+    "expo-image-picker": "~16.0.6",
+    "expo-location": "~18.0.10",
+    "express": "^4.18.2",
+    "express-validator": "^7.0.1",
+    "firebase-admin": "^12.7.0",
+    "helmet": "^7.1.0",
+    "ioredis": "^5.3.2",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^1.4.5-lts.1",
+    "pdfkit": "^0.17.2",
+    "pg": "^8.11.3",
+    "react-native-gesture-handler": "~2.20.2",
+    "react-native-qrcode-svg": "^6.3.21",
+    "react-native-svg": "15.8.0",
+    "redis": "^4.6.12",
+    "socket.io": "^4.7.2",
+    "stripe": "^14.25.0",
+    "twilio": "^4.20.0",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "private": true
+}
