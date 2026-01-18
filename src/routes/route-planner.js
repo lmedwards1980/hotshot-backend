@@ -10,16 +10,16 @@ router.use(authenticate, requireUserType('driver'));
 
 /**
  * GET /route-planner/queue
- * Get driver's planned route (queued loads in sequence order)
+ * Get driver's planned route (confirmed loads in sequence order)
  */
 router.get('/queue', async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT l.*, 
+      `SELECT l.*,
         COALESCE(l.route_sequence, 999) as sequence
        FROM loads l
-       WHERE l.driver_id = $1 
-         AND l.status IN ('assigned', 'queued', 'en_route_pickup', 'picked_up', 'en_route_delivery')
+       WHERE l.driver_id = $1
+         AND l.status IN ('assigned', 'confirmed', 'en_route_pickup', 'picked_up', 'en_route_delivery')
        ORDER BY COALESCE(l.route_sequence, 999) ASC, l.created_at ASC`,
       [req.user.id]
     );
@@ -101,18 +101,18 @@ router.post('/queue', async (req, res) => {
 
     // Get next sequence number
     const seqResult = await pool.query(
-      `SELECT COALESCE(MAX(route_sequence), 0) + 1 as next_seq 
-       FROM loads 
-       WHERE driver_id = $1 AND status IN ('assigned', 'queued')`,
+      `SELECT COALESCE(MAX(route_sequence), 0) + 1 as next_seq
+       FROM loads
+       WHERE driver_id = $1 AND status IN ('assigned', 'confirmed')`,
       [req.user.id]
     );
     const nextSequence = seqResult.rows[0].next_seq;
 
     // Add to driver's queue
     await pool.query(
-      `UPDATE loads 
-       SET driver_id = $1, 
-           status = 'queued',
+      `UPDATE loads
+       SET driver_id = $1,
+           status = 'confirmed',
            route_sequence = $2,
            scheduled_date = $3,
            updated_at = CURRENT_TIMESTAMP
@@ -153,16 +153,16 @@ router.post('/add/:loadId', async (req, res) => {
     // Get next sequence number
     const seqResult = await pool.query(
       `SELECT COALESCE(MAX(route_sequence), 0) + 1 as next_seq
-       FROM loads WHERE driver_id = $1 AND status IN ('assigned', 'queued')`,
+       FROM loads WHERE driver_id = $1 AND status IN ('assigned', 'confirmed')`,
       [req.user.id]
     );
     const nextSeq = seqResult.rows[0].next_seq;
 
     // Assign load to driver with sequence
     const result = await pool.query(
-      `UPDATE loads 
-       SET driver_id = $1, 
-           status = 'queued',
+      `UPDATE loads
+       SET driver_id = $1,
+           status = 'confirmed',
            route_sequence = $2,
            scheduled_date = $3,
            assigned_at = CURRENT_TIMESTAMP,
@@ -193,7 +193,7 @@ router.delete('/remove/:loadId', async (req, res) => {
 
     // Verify driver owns this load
     const loadCheck = await pool.query(
-      `SELECT * FROM loads WHERE id = $1 AND driver_id = $2 AND status = 'queued'`,
+      `SELECT * FROM loads WHERE id = $1 AND driver_id = $2 AND status = 'confirmed'`,
       [loadId, req.user.id]
     );
 
@@ -203,8 +203,8 @@ router.delete('/remove/:loadId', async (req, res) => {
 
     // Remove from queue (set back to posted)
     await pool.query(
-      `UPDATE loads 
-       SET driver_id = NULL, 
+      `UPDATE loads
+       SET driver_id = NULL,
            status = 'posted',
            route_sequence = NULL,
            scheduled_date = NULL,
@@ -218,8 +218,8 @@ router.delete('/remove/:loadId', async (req, res) => {
     await pool.query(
       `WITH ranked AS (
          SELECT id, ROW_NUMBER() OVER (ORDER BY route_sequence) as new_seq
-         FROM loads 
-         WHERE driver_id = $1 AND status IN ('assigned', 'queued')
+         FROM loads
+         WHERE driver_id = $1 AND status IN ('assigned', 'confirmed')
        )
        UPDATE loads SET route_sequence = ranked.new_seq
        FROM ranked WHERE loads.id = ranked.id`,
@@ -248,9 +248,9 @@ router.put('/reorder', async (req, res) => {
     // Update sequence for each load
     for (let i = 0; i < loadIds.length; i++) {
       await pool.query(
-        `UPDATE loads 
+        `UPDATE loads
          SET route_sequence = $1, updated_at = CURRENT_TIMESTAMP
-         WHERE id = $2 AND driver_id = $3 AND status IN ('assigned', 'queued')`,
+         WHERE id = $2 AND driver_id = $3 AND status IN ('assigned', 'confirmed')`,
         [i + 1, loadIds[i], req.user.id]
       );
     }
@@ -264,17 +264,17 @@ router.put('/reorder', async (req, res) => {
 
 /**
  * POST /route-planner/start
- * Start the first load in queue (move from queued to assigned)
+ * Start the first load in queue (move from confirmed to en_route_pickup)
  */
 router.post('/start', async (req, res) => {
   try {
-    // Get first queued load
+    // Get first confirmed load
     const result = await pool.query(
-      `UPDATE loads 
-       SET status = 'assigned', updated_at = CURRENT_TIMESTAMP
+      `UPDATE loads
+       SET status = 'en_route_pickup', updated_at = CURRENT_TIMESTAMP
        WHERE id = (
-         SELECT id FROM loads 
-         WHERE driver_id = $1 AND status = 'queued'
+         SELECT id FROM loads
+         WHERE driver_id = $1 AND status = 'confirmed'
          ORDER BY route_sequence ASC
          LIMIT 1
        )
@@ -283,7 +283,7 @@ router.post('/start', async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'No queued loads to start' });
+      return res.status(404).json({ error: 'No confirmed loads to start' });
     }
 
     res.json({
@@ -304,9 +304,9 @@ router.get('/suggestions', async (req, res) => {
   try {
     // Get driver's last delivery location from queue
     const lastDelivery = await pool.query(
-      `SELECT delivery_city, delivery_state 
-       FROM loads 
-       WHERE driver_id = $1 AND status IN ('assigned', 'queued')
+      `SELECT delivery_city, delivery_state
+       FROM loads
+       WHERE driver_id = $1 AND status IN ('assigned', 'confirmed')
        ORDER BY route_sequence DESC
        LIMIT 1`,
       [req.user.id]
@@ -371,7 +371,7 @@ router.get('/map-data', async (req, res) => {
         delivery_city, delivery_state, delivery_address,
         status
        FROM loads
-       WHERE driver_id = $1 AND status IN ('assigned', 'queued')
+       WHERE driver_id = $1 AND status IN ('assigned', 'confirmed')
        ORDER BY route_sequence ASC`,
       [req.user.id]
     );
