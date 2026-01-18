@@ -39,27 +39,27 @@ router.get('/profile', authenticate, async (req, res) => {
       console.log('[Drivers] Could not get delivery stats:', e.message);
     }
 
-    // Build driver response with safe defaults
+    // Build driver response with safe defaults (camelCase for API consistency)
     const driver = {
       id: user.id,
       email: user.email,
-      first_name: user.first_name,
-      last_name: user.last_name,
+      firstName: user.first_name,
+      lastName: user.last_name,
       phone: user.phone,
       role: user.role,
-      vehicle_type: user.vehicle_type || null,
-      license_plate: user.license_plate || null,
-      driver_lat: user.driver_lat || null,
-      driver_lng: user.driver_lng || null,
-      location_updated_at: user.location_updated_at || null,
-      is_available: user.is_available || false,
-      company_name: user.company_name || null,
-      total_deliveries: totalDeliveries,
+      vehicleType: user.vehicle_type || null,
+      licensePlate: user.license_plate || null,
+      driverLat: user.driver_lat || null,
+      driverLng: user.driver_lng || null,
+      locationUpdatedAt: user.location_updated_at || null,
+      isAvailable: user.is_available || false,
+      companyName: user.company_name || null,
+      totalDeliveries: totalDeliveries,
       rating: user.rating || 5.0,
-      rating_count: user.rating_count || 0,
-      is_verified: user.is_verified || false,
-      profile_image_url: user.profile_image_url || null,
-      created_at: user.created_at,
+      ratingCount: user.rating_count || 0,
+      isVerified: user.is_verified || false,
+      profileImageUrl: user.profile_image_url || null,
+      createdAt: user.created_at,
     };
 
     res.json({ driver });
